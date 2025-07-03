@@ -59,8 +59,8 @@ Welcome to PILOT, a pre-trained model-based continual learning toolbox <a href="
     }
 
 ## 📰 What's New
-- [2025-07]🌟 Check out our [latest work](https://arxiv.org/abs/2503.08510) on class-incremental learning with CLIP(**ICCV 2025**)!
-- [2025-07]🌟 Check out our [latest work](https://openreview.net/forum?id=dwjwvTwV3V&noteId=HVZe95quYK) on domain-incremental learning with PTM(**ICML 2025**)!
+- [2025-07]🌟 Check out our [latest work](https://arxiv.org/abs/2503.08510) on class-incremental learning with CLIP (**ICCV 2025**)!
+- [2025-07]🌟 Check out our [latest work](https://openreview.net/forum?id=dwjwvTwV3V&noteId=HVZe95quYK) on domain-incremental learning with PTM (**ICML 2025**)!
 - [2025-03]🌟 Add [DUCT](https://arxiv.org/abs/2410.00911). State-of-the-art method of 2025!
 - [2025-03]🌟 Check out our [latest work](https://arxiv.org/abs/2503.00823) on class-incremental learning (**CVPR 2025**)! 
 - [2025-02]🌟 Check out our [latest work](https://arxiv.org/abs/2410.00911) on pre-trained model-based domain-incremental learning (**CVPR 2025**)!
