@@ -59,7 +59,9 @@ Welcome to PILOT, a pre-trained model-based continual learning toolbox <a href="
     }
 
 ## 📰 What's New
+- [2025-08]🌟 Add [TUNA](https://arxiv.org/abs/2508.08165). State-of-the-art method of 2025! 
 - [2025-07]🌟 Check out our [latest work](https://arxiv.org/abs/2503.08510) on class-incremental learning with CLIP (**ICCV 2025**)!
+- [2025-07]🌟 Check out our [latest work](https://arxiv.org/abs/2508.08165) on pre-trained model-based class-incremental learning (**ICCV 2025**)!
 - [2025-07]🌟 Check out our [latest work](https://openreview.net/forum?id=dwjwvTwV3V&noteId=HVZe95quYK) on domain-incremental learning with PTM (**ICML 2025**)!
 - [2025-03]🌟 Add [DUCT](https://arxiv.org/abs/2410.00911). State-of-the-art method of 2025!
 - [2025-03]🌟 Check out our [latest work](https://arxiv.org/abs/2503.00823) on class-incremental learning (**CVPR 2025**)! 
@@ -100,6 +102,7 @@ Welcome to PILOT, a pre-trained model-based continual learning toolbox <a href="
 - `Aper`: Revisiting Class-Incremental Learning with Pre-Trained Models: Generalizability and Adaptivity are All You Need. IJCV 2024 [[paper](https://arxiv.org/abs/2303.07338)]
 - `MOS`: Model Surgery for Pre-Trained Model-Based Class-Incremental Learning. AAAI 2025 [[paper](https://arxiv.org/abs/2412.09441)]
 - `DUCT`: Dual Consolidation for Pre-Trained Model-Based Domain-Incremental Learning. CVPR 2025 [[paper](https://arxiv.org/abs/2410.00911)]
+- `TUNA`: Integrating Task-Specific and Universal Adapters for Pre-Trained Model-based Class-Incremental Learning. ICCV 2025 [[paper](https://arxiv.org/abs/2508.08165)]
 
 ## 📝 Reproduced Results
 
