@@ -46,6 +46,8 @@ def get_model(model_name, args):
         from models.cofima import Learner
     elif name == 'duct':
         from models.duct import Learner
+    elif name == 'tuna':
+        from models.tuna import Learner
     else:
         assert 0
     return Learner(args)
