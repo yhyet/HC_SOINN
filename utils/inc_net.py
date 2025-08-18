@@ -2,7 +2,8 @@ import copy
 import logging
 import torch
 from torch import nn
-from backbone.linears import SimpleLinear, SplitCosineLinear, CosineLinear, EaseCosineLinear, SimpleContinualLinear
+from backbone.linears import SimpleLinear, SplitCosineLinear, CosineLinear, EaseCosineLinear, SimpleContinualLinear, TunaLinear
+
 from backbone.prompt import CodaPrompt
 import timm
 
@@ -231,6 +232,37 @@ def get_backbone(args, pretrained=False):
             else:
                 raise NotImplementedError("Unknown type {}".format(name))
             return model
+    elif '_tuna' in name:
+        ffn_num = 16
+        from backbone import vit_tuna
+        from easydict import EasyDict
+        tuning_config = EasyDict(
+            # AdaptFormer
+            ffn_adapt=True,
+            ffn_option="parallel",
+            ffn_adapter_layernorm_option="none",
+            ffn_adapter_init_option="lora",
+            ffn_adapter_scalar="0.1",
+            ffn_num=ffn_num,
+            d_model=768,
+            _device=args["device"][0],
+            # VPT related
+            vpt_on=False,
+            vpt_num=0,
+        )
+        if name == "vit_base_patch16_224_tuna":
+            model = vit_tuna.vit_base_patch16_224_adapter(num_classes=args["nb_classes"],
+                                                             global_pool=False, drop_path_rate=0.0,
+                                                             tuning_config=tuning_config,
+                                                             r=args["r"])
+        elif name == "vit_base_patch16_224_in21k_tuna":
+            model = vit_tuna.vit_base_patch16_224_in21k_adapter(num_classes=args["nb_classes"],
+                                                                   global_pool=False, drop_path_rate=0.0,
+                                                                   tuning_config=tuning_config,
+                                                                   r=args["r"])
+        else:
+            raise NotImplementedError("Unknown type {}".format(name))
+        return model
     else:
         raise NotImplementedError("Unknown type {}".format(name))
 
@@ -1217,4 +1249,41 @@ class MOSNet(nn.Module):
     def forward(self, x, adapter_id=-1, train=False, fc_only=False):
         res = self.backbone(x, adapter_id, train, fc_only)
 
+        return res
+
+class TUNANet(nn.Module):
+    def __init__(self, args, pretrained):
+        super(TUNANet, self).__init__()
+        self.backbone = get_backbone(args, pretrained)
+        self.backbone.out_dim = 768
+        self.fc = None
+        self._device = args["device"][0]
+       
+
+    @property
+    def feature_dim(self):
+        return self.backbone.out_dim
+
+    def update_fc(self, nb_classes,nextperiod_initialization=None):
+      
+        if self.fc is None:
+            self.fc = self.generate_fc(self.feature_dim, nb_classes)
+        else:
+            self.fc.update(nb_classes, freeze_old=False)
+
+    def generate_fc(self, in_dim, out_dim): 
+        fc = TunaLinear(in_dim, out_dim)
+        return fc
+
+    def forward_orig(self, x):
+        features = self.backbone(x, adapter_id=0)['features']
+
+        res = dict()
+        res['features'] = features
+        res['logits'] = self.fc(features)['logits']
+
+        return res
+
+    def forward(self, x, adapter_id=-1, train=False, fc_only=False):
+        res = self.backbone(x, adapter_id, train, fc_only)
         return res
