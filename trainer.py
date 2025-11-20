@@ -7,6 +7,7 @@ from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
 import os
 import numpy as np
+from datetime import datetime
 
 
 def train(args):
@@ -27,7 +28,9 @@ def _train(args):
     if not os.path.exists(logs_name):
         os.makedirs(logs_name)
 
-    logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
+    # 生成时间戳，格式：YYYYMMDD_HHMMSS
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logfilename = "logs/{}/{}/{}/{}/{}_{}_{}_{}".format(
         args["model_name"],
         args["dataset"],
         init_cls,
@@ -35,6 +38,7 @@ def _train(args):
         args["prefix"],
         args["seed"],
         args["backbone_type"],
+        timestamp,
     )
     logging.basicConfig(
         level=logging.INFO,
@@ -62,84 +66,152 @@ def _train(args):
     args["nb_tasks"] = data_manager.nb_tasks
     model = factory.get_model(args["model_name"], args)
 
-    cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
-    cnn_matrix, nme_matrix = [], []
+    # 支持多种分类器的精度曲线
+    fc_curve = {"top1": [], "top5": []}
+    knn_curve = {"top1": [], "top5": []}
+    ncm_curve = {"top1": [], "top5": []}
+    soinn_curve = {"top1": [], "top5": []}
+    fc_matrix, knn_matrix, ncm_matrix, soinn_matrix = [], [], [], []
 
-    for task in range(data_manager.nb_tasks):
+    # 如果启用了自动加载所有checkpoint模式，从任务0开始遍历所有任务
+    start_task = 0
+    if args.get("load_all_checkpoints", False):
+        logging.info("Auto-loading all checkpoints mode enabled: will load checkpoints for all tasks and skip training")
+        start_task = 0  # 从任务0开始，依次加载所有checkpoint
+
+    for task in range(start_task, data_manager.nb_tasks):
         logging.info("All params: {}".format(count_parameters(model._network)))
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         model.incremental_train(data_manager)
-        cnn_accy, nme_accy = model.eval_task()
+        eval_results = model.eval_task()
         model.after_task()
 
-        if nme_accy is not None:
-            logging.info("CNN: {}".format(cnn_accy["grouped"]))
-            logging.info("NME: {}".format(nme_accy["grouped"]))
+        # 处理FC分类器的结果
+        if "fc" in eval_results:
+            fc_accy = eval_results["fc"]
+            logging.info("FC: {}".format(fc_accy["grouped"]))
+            fc_keys = [key for key in fc_accy["grouped"].keys() if '-' in key]
+            fc_values = [fc_accy["grouped"][key] for key in fc_keys]
+            fc_matrix.append(fc_values)
+            fc_curve["top1"].append(fc_accy["top1"])
+            fc_curve["top5"].append(fc_accy["top5"])
 
-            cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]    
-            cnn_values = [cnn_accy["grouped"][key] for key in cnn_keys]
-            cnn_matrix.append(cnn_values)
+        # 处理KNN分类器的结果
+        if "knn" in eval_results:
+            knn_accy = eval_results["knn"]
+            logging.info("KNN: {}".format(knn_accy["grouped"]))
+            knn_keys = [key for key in knn_accy["grouped"].keys() if '-' in key]
+            knn_values = [knn_accy["grouped"][key] for key in knn_keys]
+            knn_matrix.append(knn_values)
+            knn_curve["top1"].append(knn_accy["top1"])
+            knn_curve["top5"].append(knn_accy["top5"])
 
-            nme_keys = [key for key in nme_accy["grouped"].keys() if '-' in key]
-            nme_values = [nme_accy["grouped"][key] for key in nme_keys]
-            nme_matrix.append(nme_values)
+        # 处理NCM分类器的结果
+        if "ncm" in eval_results:
+            ncm_accy = eval_results["ncm"]
+            logging.info("NCM: {}".format(ncm_accy["grouped"]))
+            ncm_keys = [key for key in ncm_accy["grouped"].keys() if '-' in key]
+            ncm_values = [ncm_accy["grouped"][key] for key in ncm_keys]
+            ncm_matrix.append(ncm_values)
+            ncm_curve["top1"].append(ncm_accy["top1"])
+            ncm_curve["top5"].append(ncm_accy["top5"])
 
-            cnn_curve["top1"].append(cnn_accy["top1"])
-            cnn_curve["top5"].append(cnn_accy["top5"])
+        # 处理SOINN分类器的结果
+        if "soinn" in eval_results:
+            soinn_accy = eval_results["soinn"]
+            logging.info("SOINN: {}".format(soinn_accy["grouped"]))
+            soinn_keys = [key for key in soinn_accy["grouped"].keys() if '-' in key]
+            soinn_values = [soinn_accy["grouped"][key] for key in soinn_keys]
+            soinn_matrix.append(soinn_values)
+            soinn_curve["top1"].append(soinn_accy["top1"])
+            soinn_curve["top5"].append(soinn_accy["top5"])
 
-            nme_curve["top1"].append(nme_accy["top1"])
-            nme_curve["top5"].append(nme_accy["top5"])
+        # 统一输出所有分类器的精度曲线（只显示已启用的分类器）
+        curves_to_log = []
+        if "fc" in eval_results:
+            curves_to_log.append(("FC", fc_curve))
+        if "knn" in eval_results:
+            curves_to_log.append(("KNN", knn_curve))
+        if "ncm" in eval_results:
+            curves_to_log.append(("NCM", ncm_curve))
+        if "soinn" in eval_results:
+            curves_to_log.append(("SOINN", soinn_curve))
 
-            logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
-            logging.info("CNN top5 curve: {}".format(cnn_curve["top5"]))
-            logging.info("NME top1 curve: {}".format(nme_curve["top1"]))
-            logging.info("NME top5 curve: {}\n".format(nme_curve["top5"]))
+        for name, curve in curves_to_log:
+            logging.info("{} top1 curve: {}".format(name, curve["top1"]))
+            logging.info("{} top5 curve: {}".format(name, curve["top5"]))
 
-            print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
-            print('Average Accuracy (NME):', sum(nme_curve["top1"])/len(nme_curve["top1"]))
+        # 计算并输出平均精度
+        avg_accs = []
+        if "fc" in eval_results and len(fc_curve["top1"]) > 0:
+            avg_fc = sum(fc_curve["top1"]) / len(fc_curve["top1"])
+            avg_accs.append(("FC", avg_fc))
+            print('Average Accuracy (FC):', avg_fc)
+            logging.info("Average Accuracy (FC): {}".format(avg_fc))
 
-            logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
-            logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
-        else:
-            logging.info("No NME accuracy.")
-            logging.info("CNN: {}".format(cnn_accy["grouped"]))
+        if "knn" in eval_results and len(knn_curve["top1"]) > 0:
+            avg_knn = sum(knn_curve["top1"]) / len(knn_curve["top1"])
+            avg_accs.append(("KNN", avg_knn))
+            print('Average Accuracy (KNN):', avg_knn)
+            logging.info("Average Accuracy (KNN): {}".format(avg_knn))
 
-            cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]
-            cnn_values = [cnn_accy["grouped"][key] for key in cnn_keys]
-            cnn_matrix.append(cnn_values)
+        if "ncm" in eval_results and len(ncm_curve["top1"]) > 0:
+            avg_ncm = sum(ncm_curve["top1"]) / len(ncm_curve["top1"])
+            avg_accs.append(("NCM", avg_ncm))
+            print('Average Accuracy (NCM):', avg_ncm)
+            logging.info("Average Accuracy (NCM): {}".format(avg_ncm))
 
-            cnn_curve["top1"].append(cnn_accy["top1"])
-            cnn_curve["top5"].append(cnn_accy["top5"])
+        if "soinn" in eval_results and len(soinn_curve["top1"]) > 0:
+            avg_soinn = sum(soinn_curve["top1"]) / len(soinn_curve["top1"])
+            avg_accs.append(("SOINN", avg_soinn))
+            print('Average Accuracy (SOINN):', avg_soinn)
+            logging.info("Average Accuracy (SOINN): {}".format(avg_soinn))
 
-            logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
-            logging.info("CNN top5 curve: {}\n".format(cnn_curve["top5"]))
-
-            print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
-            logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
+        logging.info("")  # 空行分隔
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:
-        if len(cnn_matrix) > 0:
+        if len(fc_matrix) > 0:
             np_acctable = np.zeros([task + 1, task + 1])
-            for idxx, line in enumerate(cnn_matrix):
+            for idxx, line in enumerate(fc_matrix):
                 idxy = len(line)
                 np_acctable[idxx, :idxy] = np.array(line)
             np_acctable = np_acctable.T
             forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
-            print('Accuracy Matrix (CNN):')
+            print('Accuracy Matrix (FC):')
             print(np_acctable)
-            logging.info('Forgetting (CNN): {}'.format(forgetting))
-        if len(nme_matrix) > 0:
+            logging.info('Forgetting (FC): {}'.format(forgetting))
+        if len(knn_matrix) > 0:
             np_acctable = np.zeros([task + 1, task + 1])
-            for idxx, line in enumerate(nme_matrix):
+            for idxx, line in enumerate(knn_matrix):
                 idxy = len(line)
                 np_acctable[idxx, :idxy] = np.array(line)
             np_acctable = np_acctable.T
             forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
-            print('Accuracy Matrix (NME):')
+            print('Accuracy Matrix (KNN):')
             print(np_acctable)
-        logging.info('Forgetting (NME): {}'.format(forgetting))
+            logging.info('Forgetting (KNN): {}'.format(forgetting))
+        if len(ncm_matrix) > 0:
+            np_acctable = np.zeros([task + 1, task + 1])
+            for idxx, line in enumerate(ncm_matrix):
+                idxy = len(line)
+                np_acctable[idxx, :idxy] = np.array(line)
+            np_acctable = np_acctable.T
+            forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
+            print('Accuracy Matrix (NCM):')
+            print(np_acctable)
+            logging.info('Forgetting (NCM): {}'.format(forgetting))
+        if len(soinn_matrix) > 0:
+            np_acctable = np.zeros([task + 1, task + 1])
+            for idxx, line in enumerate(soinn_matrix):
+                idxy = len(line)
+                np_acctable[idxx, :idxy] = np.array(line)
+            np_acctable = np_acctable.T
+            forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
+            print('Accuracy Matrix (SOINN):')
+            print(np_acctable)
+            logging.info('Forgetting (SOINN): {}'.format(forgetting))
 
 
 def _set_device(args):

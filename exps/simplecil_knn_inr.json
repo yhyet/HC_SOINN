@@ -5,9 +5,9 @@
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": true,
-    "init_cls": 5,
-    "increment": 5,
-    "model_name": "simplecil",
+    "init_cls": 20,
+    "increment": 20,
+    "model_name": "simplecil_knn",
     "backbone_type": "pretrained_vit_b16_224",
     "device": ["0"],
     "seed": [1993],
@@ -19,6 +19,10 @@
     "min_lr": 1e-8,
     "optimizer": "sgd",
     "vpt_type": "shallow",
-    "prompt_token_num": 3
+    "prompt_token_num": 3,
+    "knn_k": 11,
+    "use_knn": true,
+    "knn_metric": "euclidean",
+    "knn_use_all": true
 }
 

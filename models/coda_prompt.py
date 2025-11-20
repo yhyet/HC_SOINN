@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader
 from utils.inc_net import CodaPromptVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
+from utils.knn_classifier import KNNClassifier
+import os
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -26,19 +28,80 @@ class Learner(BaseLearner):
         self.weight_decay = args["weight_decay"] if args["weight_decay"] is not None else 0.0005
         self.min_lr = args["min_lr"] if args["min_lr"] is not None else 1e-8
         self.args = args
+        # KNN plugin
+        self.use_knn = args.get("use_knn", False)
+        self.knn_upperbound = args.get("knn_upperbound", False)  # KNN上限测试模式
+        if self.use_knn:
+            knn_metric = args.get("knn_metric", "euclidean")
+            logging.info(f"Initializing KNNClassifier with metric: {knn_metric}")
+            if self.knn_upperbound:
+                logging.info("KNN Upperbound mode enabled: will rebuild KNN bank with all seen tasks at eval time")
+            self.knn = KNNClassifier(
+                metric=knn_metric,
+                use_all_samples=args.get("knn_use_all", True),
+                k_neighbors=args.get("knn_k", None),
+            )
+            logging.info(f"KNNClassifier initialized with metric: {self.knn.metric}")
         
         total_params = sum(p.numel() for p in self._network.parameters())
         logging.info(f'{total_params:,} total parameters.')
         total_trainable_params = sum(p.numel() for p in self._network.fc.parameters() if p.requires_grad) + sum(p.numel() for p in self._network.prompt.parameters() if p.requires_grad)
         logging.info(f'{total_trainable_params:,} fc and prompt training parameters.')
-
+        
+        # NCM分类器：初始化类均值存储
+        self._class_means = None
+        # feature_dim 是 BaseLearner 的 @property，会从 self._network.feature_dim 获取
+        # 不需要在这里设置，CodaPromptVitNet 中已经有 feature_dim 属性
 
     def after_task(self):
         self._known_classes = self._total_classes
+        # 保存checkpoint（每个任务训练完后）
+        if self.args.get("save_checkpoint", False):
+            self.save_checkpoint()
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
-
+        
+        # 如果启用了自动加载所有checkpoint模式，跳过训练，只加载checkpoint
+        if self.args.get("load_all_checkpoints", False):
+            self._load_checkpoint_for_task()
+            # 加载checkpoint后，checkpoint中已经保存了正确的状态（_cur_task, _known_classes, _total_classes）
+            # 但需要确保_total_classes与当前任务划分一致（因为可能因为任务划分而不同）
+            # 重新计算以确保一致性
+            expected_total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
+            if self._total_classes != expected_total_classes:
+                logging.warning(
+                    f"Total classes mismatch: checkpoint has {self._total_classes}, "
+                    f"expected {expected_total_classes}. Using expected value."
+                )
+                self._total_classes = expected_total_classes
+            logging.info("Learning on {}-{} (checkpoint loaded, skipping training)".format(self._known_classes, self._total_classes))
+            
+            # 准备测试数据
+            test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
+            self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
+            
+            # 更新prompt的任务计数（如果需要）
+            if self._cur_task > 0:
+                try:
+                    if self._network.module.prompt is not None:
+                        self._network.module.prompt.process_task_count()
+                except:
+                    if self._network.prompt is not None:
+                        self._network.prompt.process_task_count()
+            
+            # 准备测试数据（与正常训练流程一致）
+            train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="train")
+            self.train_dataset = train_dataset
+            self.data_manager = data_manager
+            test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
+            self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
+            
+            # 统一构建所有分类器（与正常训练流程一致）
+            self._build_classifiers()
+            
+            return  # 跳过训练部分
+        
         if self._cur_task > 0:
             try:
                 if self._network.module.prompt is not None:
@@ -47,9 +110,10 @@ class Learner(BaseLearner):
                 if self._network.prompt is not None:
                     self._network.prompt.process_task_count()
 
-        self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
-        # self._network.update_fc(self._total_classes)
-        logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
+        if not self.args.get("load_all_checkpoints", False):
+            self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
+            # self._network.update_fc(self._total_classes)
+            logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
 
         train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="train")
         self.train_dataset = train_dataset
@@ -64,6 +128,10 @@ class Learner(BaseLearner):
         self._train(self.train_loader, self.test_loader)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
+        
+        # 训练结束后，统一构建所有分类器（NCM、KNN等）
+        # 无论是正常训练还是加载checkpoint，都在这里统一构建
+        self._build_classifiers()
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
@@ -73,6 +141,312 @@ class Learner(BaseLearner):
 
         self.data_weighting()
         self._init_train(train_loader, test_loader, optimizer, scheduler)
+
+        # 注意：分类器构建已移至 _build_classifiers() 方法，在训练结束后统一构建
+
+    def _build_classifiers(self):
+        """
+        统一构建所有分类器（在训练结束后、测试开始前调用）
+        包括：NCM分类器、KNN bank（普通模式或upperbound模式）
+        无论是正常训练还是加载checkpoint，都在这里统一构建
+        """
+        logging.info(f"Building classifiers for task {self._cur_task} (total classes: {self._total_classes})")
+        
+        # 确保模型在正确的设备上并处于eval模式
+        self._network.to(self._device)
+        self._network.eval()
+        
+        # 1. 构建NCM分类器：计算所有已见过的任务的类均值
+        self._build_ncm_classifier()
+        
+        # 2. 构建KNN bank
+        if getattr(self, "use_knn", False):
+            if getattr(self, "knn_upperbound", False):
+                # Upperbound模式：使用所有已见过的任务重新提取特征
+                self._build_knn_bank_upperbound()
+            else:
+                # 普通模式：使用所有已见过的任务重新提取特征（与upperbound一致，但会在评估时使用）
+                self._build_knn_bank()
+        
+        logging.info("All classifiers built successfully")
+    
+    def _build_ncm_classifier(self):
+        """
+        构建NCM分类器：累积存储机制
+        - 如果之前有类均值（正常训练）：保留之前任务的类均值，只计算当前任务新类别的类均值
+        - 如果没有类均值（首次任务或加载checkpoint后）：计算所有已见过的任务的类均值
+        - 这样符合增量学习的累积存储要求
+        """
+        # 判断是否需要重建所有类均值（首次任务或加载checkpoint后）
+        need_rebuild_all = (self._class_means is None) or (self._class_means.shape[0] == 0)
+        
+        if need_rebuild_all:
+            # 首次任务或加载checkpoint后：需要计算所有已见过的任务的类均值
+            logging.info(f"Building NCM classifier: computing all seen classes (0-{self._total_classes-1}) [first task or after checkpoint load]")
+            all_train_dataset = self.data_manager.get_dataset(
+                np.arange(0, self._total_classes), source="train", mode="test"
+            )
+            all_train_loader = DataLoader(
+                all_train_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=num_workers
+            )
+            
+            # 初始化类均值数组
+            self._class_means = np.zeros((self._total_classes, self.feature_dim))
+            
+            # 提取所有训练样本的特征
+            embedding_list = []
+            label_list = []
+            
+            with torch.no_grad():
+                for _, (_, inputs, targets) in enumerate(all_train_loader):
+                    inputs = inputs.to(self._device)
+                    if isinstance(self._network, nn.DataParallel):
+                        embeddings = self._network.module.extract_vector(inputs)
+                    else:
+                        embeddings = self._network.extract_vector(inputs)
+                    embedding_list.append(embeddings.cpu())
+                    label_list.append(targets.cpu())
+            
+            if len(embedding_list) > 0:
+                embedding_list = torch.cat(embedding_list, dim=0)
+                label_list = torch.cat(label_list, dim=0)
+                
+                # 计算所有已见过的类别的均值
+                class_list = np.unique(label_list.numpy())
+                for class_index in class_list:
+                    data_index = (label_list == class_index).nonzero().squeeze(-1)
+                    embedding = embedding_list[data_index]
+                    proto = embedding.mean(0)
+                    self._class_means[int(class_index), :] = proto.cpu().numpy()
+                
+                logging.info(f"NCM classifier built: computed class means for {len(class_list)} classes (total: {self._total_classes} classes)")
+            else:
+                logging.warning("No training data available for NCM classifier")
+        else:
+            # 正常训练：累积存储机制 - 保留之前的类均值，只计算当前任务新类别的类均值
+            logging.info(f"Building NCM classifier: preserving previous class means, computing new classes ({self._known_classes}-{self._total_classes-1})")
+            
+            # 扩展类均值数组以容纳新类别，保留之前的类均值
+            if self._class_means.shape[0] < self._total_classes:
+                new_class_means = np.zeros((self._total_classes, self.feature_dim))
+                new_class_means[:self._class_means.shape[0]] = self._class_means
+                self._class_means = new_class_means
+                logging.info(f"Extended NCM classifier: preserved {self._class_means.shape[0] - (self._total_classes - self._known_classes)} previous class means")
+            
+            # 只获取当前任务的训练数据（累积存储：过往数据已存储，只需添加当前任务）
+            current_task_dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes), source="train", mode="test"
+            )
+            current_task_loader = DataLoader(
+                current_task_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=num_workers
+            )
+            
+            # 提取当前任务训练样本的特征
+            embedding_list = []
+            label_list = []
+            
+            with torch.no_grad():
+                for _, (_, inputs, targets) in enumerate(current_task_loader):
+                    inputs = inputs.to(self._device)
+                    if isinstance(self._network, nn.DataParallel):
+                        embeddings = self._network.module.extract_vector(inputs)
+                    else:
+                        embeddings = self._network.extract_vector(inputs)
+                    embedding_list.append(embeddings.cpu())
+                    label_list.append(targets.cpu())
+            
+            if len(embedding_list) > 0:
+                embedding_list = torch.cat(embedding_list, dim=0)
+                label_list = torch.cat(label_list, dim=0)
+                
+                # 只计算当前任务新类别的均值（累积存储：过往类均值已保留）
+                class_list = np.unique(label_list.numpy())
+                for class_index in class_list:
+                    data_index = (label_list == class_index).nonzero().squeeze(-1)
+                    embedding = embedding_list[data_index]
+                    proto = embedding.mean(0)
+                    self._class_means[int(class_index), :] = proto.cpu().numpy()
+                
+                logging.info(f"NCM classifier updated: computed class means for {len(class_list)} new classes (total: {self._total_classes} classes)")
+            else:
+                logging.warning("No training data available for NCM classifier update")
+        
+        # 更新所有类别的NCM FC层权重
+        if isinstance(self._network, nn.DataParallel):
+            for class_index in range(self._total_classes):
+                if np.any(self._class_means[class_index] != 0):  # 只更新有数据的类别
+                    self._network.module.ncm_fc.weight.data[int(class_index), :] = torch.from_numpy(self._class_means[int(class_index), :]).float().to(self._device)
+        else:
+            for class_index in range(self._total_classes):
+                if np.any(self._class_means[class_index] != 0):  # 只更新有数据的类别
+                    self._network.ncm_fc.weight.data[int(class_index), :] = torch.from_numpy(self._class_means[int(class_index), :]).float().to(self._device)
+    
+    def _build_knn_bank(self):
+        """
+        构建KNN bank（普通模式）：累积存储机制
+        - 如果KNN bank为空（首次任务或加载checkpoint后）：需要重建所有已见过的任务的features
+        - 如果KNN bank不为空（正常训练）：保留之前任务的features，只添加当前任务新类别的features
+        - 这样符合增量学习的累积存储要求
+        """
+        # 判断是否需要重建所有features（首次任务或加载checkpoint后）
+        # 检查KNN bank是否为空（通过检查是否有任何类别的features）
+        knn_bank_empty = (not hasattr(self.knn, 'class_to_features')) or (len(self.knn.class_to_features) == 0)
+        
+        if knn_bank_empty:
+            # 首次任务或加载checkpoint后：需要计算所有已见过的任务的features
+            logging.info(f"Building KNN bank: computing all seen classes (0-{self._total_classes-1}) [first task or after checkpoint load]")
+            all_train_dataset = self.data_manager.get_dataset(
+                np.arange(0, self._total_classes), source="train", mode="test"
+            )
+            all_train_loader = DataLoader(
+                all_train_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=num_workers
+            )
+            
+            # 定义特征提取函数
+            def feature_fn(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module(x, pen=True, train=False)
+                else:
+                    feats = self._network(x, pen=True, train=False)
+                
+                if isinstance(feats, tuple):
+                    feats = feats[0]
+                
+                if not isinstance(feats, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(feats)}")
+                
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                elif len(feats.shape) != 2:
+                    raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+                
+                return feats
+            
+            # 清空并重建所有features
+            self.knn.clear()
+            with torch.no_grad():
+                self.knn.add_from_loader(all_train_loader, feature_fn, self._device)
+            
+            logging.info(f"KNN bank built: computed features for {self._total_classes} classes")
+        else:
+            # 正常训练：累积存储机制 - 保留之前的features，只添加当前任务新类别的features
+            logging.info(f"Building KNN bank: preserving previous features, adding new classes ({self._known_classes}-{self._total_classes-1})")
+            
+            # 注意：不清空KNN bank，保留之前的features（累积存储）
+            
+            # 定义特征提取函数
+            def feature_fn(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module(x, pen=True, train=False)
+                else:
+                    feats = self._network(x, pen=True, train=False)
+                
+                if isinstance(feats, tuple):
+                    feats = feats[0]
+                
+                if not isinstance(feats, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(feats)}")
+                
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                elif len(feats.shape) != 2:
+                    raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+                
+                return feats
+            
+            # 只获取当前任务的训练数据（累积存储：过往features已存储在KNN bank中）
+            current_task_dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes), source="train", mode="test"
+            )
+            current_task_loader = DataLoader(
+                current_task_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=num_workers
+            )
+            
+            # 只添加当前任务的特征到KNN bank（累积存储：过往features已保留）
+            with torch.no_grad():
+                self.knn.add_from_loader(current_task_loader, feature_fn, self._device)
+            
+            logging.info(f"KNN bank updated: added features for classes {self._known_classes}-{self._total_classes-1} (previous features preserved)")
+    
+    def _build_knn_bank_upperbound(self):
+        """
+        构建KNN bank（Upperbound模式）：不需要存储机制
+        - 每次评估时都会重新构建（在eval_task中），使用最新的模型特征
+        - 不使用累积存储，每次都重新提取所有数据（当前+过往）的特征
+        - 训练结束后不需要构建，因为评估时会重建
+        """
+        # Upperbound模式：不需要在训练结束后构建
+        # 因为每次评估时都会重新构建，使用最新的模型特征
+        # 这样可以避免特征漂移，测试KNN方法的上限
+        logging.info("KNN upperbound mode: skipping build at training end (will be rebuilt at eval time with latest model)")
+    
+    def _build_knn_bank_upperbound_at_eval(self):
+        """
+        在评估时构建KNN bank（Upperbound模式）：
+        不使用累积存储，每次都重新提取所有数据（当前+过往）的特征
+        使用最新的模型特征，避免特征漂移
+        """
+        logging.info(f"Rebuilding KNN bank in upperbound mode: using all seen classes (0-{self._total_classes-1}) with latest model")
+        
+        # 清空KNN bank（不使用累积存储）
+        self.knn.clear()
+        
+        # 确保模型处于eval模式
+        self._network.eval()
+        
+        # 定义特征提取函数
+        def feature_fn(x):
+            if isinstance(self._network, nn.DataParallel):
+                feats = self._network.module(x, pen=True, train=False)
+            else:
+                feats = self._network(x, pen=True, train=False)
+            
+            if isinstance(feats, tuple):
+                feats = feats[0]
+            
+            if not isinstance(feats, torch.Tensor):
+                raise TypeError(f"Expected tensor, got {type(feats)}")
+            
+            if len(feats.shape) == 1:
+                feats = feats.reshape(1, -1)
+            elif len(feats.shape) != 2:
+                raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+            
+            return feats
+        
+        # 获取所有已见过的任务的训练数据（不使用累积存储，每次都重新提取）
+        all_train_dataset = self.data_manager.get_dataset(
+            np.arange(0, self._total_classes), source="train", mode="test"
+        )
+        all_train_loader = DataLoader(
+            all_train_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False, 
+            drop_last=False, 
+            num_workers=num_workers
+        )
+        
+        # 使用最新的模型重新提取所有训练样本的特征并添加到KNN bank
+        with torch.no_grad():
+            self.knn.add_from_loader(all_train_loader, feature_fn, self._device)
+        
+        logging.info(f"KNN bank rebuilt in upperbound mode with {self._total_classes} classes using latest model features")
 
     def data_weighting(self):
         self.dw_k = torch.tensor(np.ones(self._total_classes + 1, dtype=np.float32))
@@ -159,7 +533,8 @@ class Learner(BaseLearner):
 
         logging.info(info)
 
-    def _eval_cnn(self, loader):
+    def _eval_fc(self, loader):
+        """使用原始FC层进行评估"""
         self._network.eval()
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):
@@ -168,13 +543,106 @@ class Learner(BaseLearner):
                 outputs = self._network(inputs)[:, :self._total_classes]
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            )[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
+        return np.concatenate(y_pred), np.concatenate(y_true)
+    
+    def _eval_knn(self, loader):
+        """使用KNN分类器进行评估"""
+        self._network.eval()
+        y_pred, y_true = [], []
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                # 提取特征（与训练时添加到KNN bank的特征提取方式保持一致）
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module(inputs, pen=True, train=False)
+                else:
+                    feats = self._network(inputs, pen=True, train=False)
+                
+                # 确保特征形状正确 [B, D]
+                if isinstance(feats, tuple):
+                    feats = feats[0]
+                
+                if not isinstance(feats, torch.Tensor):
+                    raise TypeError(f"Expected tensor, got {type(feats)}")
+                
+                feats = feats.detach().cpu()
+                
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                elif len(feats.shape) != 2:
+                    raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+                
+                # 转换为 numpy 并预测
+                feats_np = feats.numpy()
+                topk_pred = self.knn.predict_topk(feats_np, self.topk, self._total_classes)
+                y_pred.append(topk_pred)
+                y_true.append(targets.cpu().numpy())
+        
+        if len(y_pred) == 0:
+            logging.warning("No predictions generated from KNN evaluation")
+            return np.array([]), np.array([])
+        
+        return np.concatenate(y_pred), np.concatenate(y_true)
 
-        return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+    def _eval_ncm_fc(self, loader):
+        """使用NCM FC层进行评估（CosineLinear会自动归一化）"""
+        self._network.eval()
+        y_pred, y_true = [], []
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                # 提取特征（不需要归一化，CosineLinear会自动归一化）
+                if isinstance(self._network, nn.DataParallel):
+                    features = self._network.module.extract_vector(inputs)
+                    # CosineLinear返回字典格式 {'logits': ...}
+                    ncm_output = self._network.module.ncm_fc(features)
+                else:
+                    features = self._network.extract_vector(inputs)
+                    # CosineLinear返回字典格式 {'logits': ...}
+                    ncm_output = self._network.ncm_fc(features)
+                # 提取logits
+                ncm_logits = ncm_output['logits']
+                # 只保留已学习类别
+                ncm_logits = ncm_logits[:, :self._total_classes]
+                # Top-k预测
+                predicts = torch.topk(
+                    ncm_logits, k=self.topk, dim=1, largest=True, sorted=True
+                )[1]
+                y_pred.append(predicts.cpu().numpy())
+                y_true.append(targets.cpu().numpy())
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def eval_task(self):
+        """
+        评估任务：分别评估FC、KNN（如果启用）、NCM（如果启用）三种分类器
+        返回所有分类器的精度结果
+        """
+        # 如果启用了knn_upperbound，在评估前重新构建KNN bank（使用最新的模型特征）
+        if getattr(self, "use_knn", False) and getattr(self, "knn_upperbound", False):
+            logging.info("Rebuilding KNN bank in upperbound mode at eval time (using all data with latest model)")
+            self._build_knn_bank_upperbound_at_eval()
+        
+        results = {}
+        
+        # 1. 使用原始FC分类器评估
+        y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
+        results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
+        
+        # 2. 使用KNN分类器评估（如果启用）
+        if getattr(self, "use_knn", False):
+            y_pred_knn, y_true_knn = self._eval_knn(self.test_loader)
+            results["knn"] = self._evaluate(y_pred_knn, y_true_knn)
+        
+        # 3. 使用NCM分类器评估（如果已计算类均值）
+        if hasattr(self, "_class_means") and self._class_means is not None:
+            y_pred_ncm, y_true_ncm = self._eval_ncm_fc(self.test_loader)
+            results["ncm"] = self._evaluate(y_pred_ncm, y_true_ncm)
+        
+        return results
+    
 
     def _compute_accuracy(self, model, loader):
         model.eval()
@@ -188,6 +656,127 @@ class Learner(BaseLearner):
             total += len(targets)
 
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+    def save_checkpoint(self):
+        """
+        保存checkpoint，只保存模型参数本身（backbone, fc, prompt），
+        不包括ncm_fc和knn相关内容
+        """
+        checkpoint_dir = self.args.get("checkpoint_dir", "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # 构建checkpoint文件名
+        checkpoint_name = self.args.get("checkpoint_name", 
+            f"{self.args['model_name']}_{self.args['dataset']}_{self.args['init_cls']}_{self.args['increment']}")
+        checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_name}_task{self._cur_task}.pkl")
+        
+        # 获取模型（如果是DataParallel，需要获取module）
+        model = self._network
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        
+        # 只保存需要的部分：backbone, fc, prompt
+        save_dict = {
+            "task": self._cur_task,
+            "known_classes": self._known_classes,
+            "total_classes": self._total_classes,
+            "backbone_state_dict": model.backbone.state_dict(),
+            "fc_state_dict": model.fc.state_dict(),
+            "prompt_state_dict": model.prompt.state_dict() if model.prompt is not None else None,
+        }
+        
+        torch.save(save_dict, checkpoint_path)
+        logging.info(f"Checkpoint saved to {checkpoint_path}")
+
+    def load_checkpoint(self, checkpoint_path):
+        """
+        从checkpoint加载模型参数
+        
+        参数:
+            checkpoint_path: checkpoint文件路径
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+        
+        logging.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self._device)
+        
+        # 获取模型（如果是DataParallel，需要获取module）
+        model = self._network
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        
+        # 加载backbone
+        if "backbone_state_dict" in checkpoint:
+            model.backbone.load_state_dict(checkpoint["backbone_state_dict"])
+            logging.info("Backbone loaded successfully")
+        
+        # 加载fc层（需要处理类别数可能不同的情况）
+        if "fc_state_dict" in checkpoint:
+            fc_state = checkpoint["fc_state_dict"]
+            current_fc_state = model.fc.state_dict()
+            
+            # 如果checkpoint中的fc类别数与当前不同，需要调整
+            if fc_state["weight"].shape[0] != current_fc_state["weight"].shape[0]:
+                logging.warning(
+                    f"FC layer size mismatch: checkpoint has {fc_state['weight'].shape[0]} classes, "
+                    f"current model has {current_fc_state['weight'].shape[0]} classes. "
+                    f"Loading compatible weights only."
+                )
+                # 只加载兼容的部分
+                min_classes = min(fc_state["weight"].shape[0], current_fc_state["weight"].shape[0])
+                current_fc_state["weight"][:min_classes] = fc_state["weight"][:min_classes]
+                if "bias" in fc_state and "bias" in current_fc_state:
+                    current_fc_state["bias"][:min_classes] = fc_state["bias"][:min_classes]
+                model.fc.load_state_dict(current_fc_state)
+            else:
+                model.fc.load_state_dict(fc_state)
+            logging.info("FC layer loaded successfully")
+        
+        # 加载prompt
+        if "prompt_state_dict" in checkpoint and checkpoint["prompt_state_dict"] is not None:
+            if model.prompt is not None:
+                model.prompt.load_state_dict(checkpoint["prompt_state_dict"])
+                logging.info("Prompt loaded successfully")
+            else:
+                logging.warning("Checkpoint contains prompt state but current model has no prompt")
+        
+        # 恢复任务相关的状态
+        if "task" in checkpoint:
+            # 恢复任务编号（加载的是task N的checkpoint，接下来要训练task N+1）
+            self._cur_task = checkpoint["task"]
+            logging.info(f"Restored task: {self._cur_task}")
+        
+        if "known_classes" in checkpoint:
+            self._known_classes = checkpoint["known_classes"]
+            logging.info(f"Restored known_classes: {self._known_classes}")
+        
+        if "total_classes" in checkpoint:
+            # 恢复total_classes（但后续可能会根据任务划分重新计算）
+            self._total_classes = checkpoint["total_classes"]
+            logging.info(f"Restored total_classes: {self._total_classes}")
+        
+        # 确保模型在正确的设备上
+        self._network.to(self._device)
+        logging.info("Checkpoint loaded successfully")
+    
+    def _load_checkpoint_for_task(self):
+        """
+        为当前任务加载checkpoint（用于自动加载所有checkpoint模式）
+        """
+        checkpoint_dir = self.args.get("checkpoint_dir", "checkpoints")
+        checkpoint_name = self.args.get("checkpoint_name", 
+            f"{self.args['model_name']}_{self.args['dataset']}_{self.args['init_cls']}_{self.args['increment']}")
+        checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_name}_task{self._cur_task}.pkl")
+        
+        if os.path.exists(checkpoint_path):
+            logging.info(f"Loading checkpoint for task {self._cur_task}: {checkpoint_path}")
+            self.load_checkpoint(checkpoint_path)
+        else:
+            raise FileNotFoundError(
+                f"Checkpoint not found for task {self._cur_task}: {checkpoint_path}. "
+                f"Please ensure all checkpoints are saved with save_checkpoint=True"
+            )
 
 
 class _LRScheduler(object):
@@ -240,6 +829,9 @@ class CosineSchedule(_LRScheduler):
         super().__init__(optimizer, -1)
 
     def cosine(self, base_lr):
+        # 处理 K=1 的情况，避免除以零
+        if self.K <= 1:
+            return base_lr
         return base_lr * math.cos((99 * math.pi * (self.last_epoch)) / (200 * (self.K-1)))
 
     def get_lr(self):

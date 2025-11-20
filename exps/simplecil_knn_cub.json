@@ -1,17 +1,17 @@
 {
     "prefix": " ",
-    "dataset": "imagenetr",
+    "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": true,
-    "init_cls": 5,
-    "increment": 5,
-    "model_name": "simplecil",
+    "init_cls": 10,
+    "increment": 10,
+    "model_name": "simplecil_knn",
     "backbone_type": "pretrained_vit_b16_224",
     "device": ["0"],
     "seed": [1993],
-    
+
     "tuned_epoch": 0,
     "init_lr": 0.01,
     "batch_size": 256,
@@ -19,6 +19,9 @@
     "min_lr": 1e-8,
     "optimizer": "sgd",
     "vpt_type": "shallow",
-    "prompt_token_num": 3
+    "prompt_token_num": 3,
+    "knn_k": 31,
+    "use_knn": true,
+    "knn_metric": "cosine",
+    "knn_use_all": true
 }
-

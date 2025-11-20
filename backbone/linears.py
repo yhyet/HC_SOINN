@@ -7,7 +7,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from copy import deepcopy
-from timm.models.layers.weight_init import trunc_normal_
+try:
+    from timm.models.layers.weight_init import trunc_normal_
+except ImportError:
+    from timm.layers.weight_init import trunc_normal_
 
 
 class SimpleLinear(nn.Module):

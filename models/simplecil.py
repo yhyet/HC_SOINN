@@ -78,7 +78,4 @@ class Learner(BaseLearner):
         self._network.to(self._device)
         self.replace_fc(train_loader_for_protonet, self._network, None)
 
-        
-    
-
    

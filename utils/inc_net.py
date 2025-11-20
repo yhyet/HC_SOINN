@@ -614,6 +614,29 @@ class SimpleVitNet(BaseNet):
         out.update({"features": x})
         return out
 
+# SimpleCIL-KNN
+class SimpleVitNetKNN(BaseNet):
+    def __init__(self, args, pretrained):
+        super().__init__(args, pretrained)
+        # 不需要分类器，因为使用KNN进行分类
+
+    def update_fc(self, nb_classes, nextperiod_initialization=None):
+        # KNN方法不需要更新分类器
+        pass
+
+    def generate_fc(self, in_dim, out_dim):
+        # KNN方法不需要生成分类器
+        return None
+
+    def extract_vector(self, x):
+        return self.backbone(x)
+
+    def forward(self, x):
+        x = self.backbone(x)
+        # 不进行分类，直接返回特征
+        out = {"features": x}
+        return out
+
 # l2p and dualprompt
 class PromptVitNet(nn.Module):
     def __init__(self, args, pretrained):
@@ -652,6 +675,10 @@ class CodaPromptVitNet(nn.Module):
         self.backbone = get_backbone(args, pretrained)
         self.fc = nn.Linear(768, args["nb_classes"])
         self.prompt = CodaPrompt(768, args["nb_tasks"], args["prompt_param"])
+        # NCM分类器：用于存储类均值的FC层（使用CosineLinear，自动归一化）
+        self.ncm_fc = CosineLinear(768, args["nb_classes"], sigma=False)
+        # 添加feature_dim属性，用于BaseLearner的@property
+        self.feature_dim = 768
 
     # pen: get penultimate features  
     def forward(self, x, pen=False, train=False):
@@ -671,6 +698,20 @@ class CodaPromptVitNet(nn.Module):
             return out, prompt_loss
         else:
             return out
+    
+    def extract_vector(self, x):
+        """提取特征向量，用于NCM分类器"""
+        if self.prompt is not None:
+            with torch.no_grad():
+                q, _ = self.backbone(x)
+                q = q[:,0,:]
+            out, _ = self.backbone(x, prompt=self.prompt, q=q, train=False)
+            out = out[:,0,:]
+        else:
+            out, _ = self.backbone(x)
+            out = out[:,0,:]
+        out = out.view(out.size(0), -1)
+        return out
 
 
 class MultiBranchCosineIncrementalNet(BaseNet):
