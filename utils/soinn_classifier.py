@@ -149,33 +149,24 @@ class _SOINN_per_class:
             # 2) 计算相似度阈值 T_s1 和 T_s2（使用邻居最大距或最小全局距）
             T1 = self._similarity_threshold(s1) * self.threshold_scale
             T2 = self._similarity_threshold(s2) * self.threshold_scale
-            
-            # 动态调整阈值：如果当前节点数少于目标节点数，降低阈值（更容易插入）
-            current_node_ratio = len(self.nodes) / max(target_nodes, 1)
-            if current_node_ratio < 0.5:
-                # 节点数不足目标的一半，大幅降低阈值
-                dynamic_scale = 0.3
-            elif current_node_ratio < 0.8:
-                # 节点数接近目标，适度降低阈值
-                dynamic_scale = 0.5
-            else:
-                # 节点数足够，使用原始阈值
-                dynamic_scale = 1.0
-            
-            T1 *= dynamic_scale
-            T2 *= dynamic_scale
 
             # 3) between-class 插入判断：若距离大于阈值，插入新节点
-            # 使用更宽松的条件：只要距离大于任一阈值的缩放版本就插入
-            # 或者如果节点数远少于目标，强制插入一些节点
-            force_insert = (len(self.nodes) < target_nodes * 0.3) and (t % max(1, n_samples // target_nodes) == 0)
-            
-            if dists[s1] > T1 or dists[s2] > T2 or force_insert:
+            if dists[s1] > T1 or dists[s2] > T2:
                 # 插入新的节点 x（归一化）
                 # 若设置了 max_nodes，且已达上限，可用替换或跳过插入策略（此处简单跳过插入）
                 if (self.max_nodes is None) or (len(self.nodes) < self.max_nodes):
+                    new_node_idx = len(self.nodes)  # 新节点的索引
                     self.nodes.append(x_norm.copy())
                     self.win_count.append(1)
+                    
+                    # 插入新节点后，需要与 winner 和 second winner 建立连接
+                    # 这样新节点就不会是孤立的，避免被删除
+                    if s1 not in self.edges[new_node_idx]:
+                        self.edges[new_node_idx][s1] = 0
+                        self.edges[s1][new_node_idx] = 0
+                    if s2 != s1 and s2 not in self.edges[new_node_idx]:
+                        self.edges[new_node_idx][s2] = 0
+                        self.edges[s2][new_node_idx] = 0
                 # 插入后不继续更新已有节点（按论文行为）
                 continue
 
@@ -338,6 +329,8 @@ class SOINNClassifier:
         # 训练后保存的原型与标签
         self.prototypes = None  # numpy array shape (M, D)
         self.prototype_labels = None  # numpy array shape (M,)
+        # 预先归一化的原型（用于加速推理）
+        self.prototypes_norm = None  # numpy array shape (M, D)，已归一化
 
         # 每个类的 soinn 模型（若需要检查）
         self._class_models = {}
@@ -346,6 +339,7 @@ class SOINNClassifier:
         """清空整个原型库。"""
         self.prototypes = None
         self.prototype_labels = None
+        self.prototypes_norm = None
         self._class_models.clear()
 
     def add_features(self, features: np.ndarray, labels: np.ndarray) -> None:
@@ -430,19 +424,25 @@ class SOINNClassifier:
             # 保持原型为 None，在 predict_topk 中会处理
             self.prototypes = None
             self.prototype_labels = np.array([], dtype=np.int64)
+            self.prototypes_norm = None
             return
 
         self.prototypes = np.vstack(all_protos)  # shape (M, D)
         self.prototype_labels = np.array(all_labels, dtype=np.int64)
+        # 预先归一化原型，用于加速推理
+        norms = np.linalg.norm(self.prototypes, axis=1, keepdims=True)
+        self.prototypes_norm = self.prototypes / (norms + 1e-8)  # shape (M, D)
 
-    def predict_topk(self, query_features: np.ndarray, topk: int, total_classes: int) -> np.ndarray:
+    def predict_topk(self, query_features: np.ndarray, topk: int, total_classes: int, device: Optional[torch.device] = None) -> np.ndarray:
         """
         使用训练好的原型进行预测（K-NN投票），返回 top-k 类别索引。
+        优化版本：使用矩阵运算和 GPU 加速。
 
         参数:
         - query_features: [N, D] 查询特征矩阵。
         - topk: 返回前 k 个类别。
         - total_classes: 当前已学习的类别总数（用于在样本不足时补齐不重复的类别索引）。
+        - device: 可选的 torch.device，用于 GPU 加速。如果为 None，使用 CPU。
 
         返回:
         - [N, topk] 的 numpy 数组，每行为一个查询的 top-k 类别索引。
@@ -453,62 +453,176 @@ class SOINNClassifier:
             return np.tile(fallback, (query_features.shape[0], 1))
 
         query_features = np.asarray(query_features)
-        preds = []
+        N = query_features.shape[0]  # 查询样本数
+        M = self.prototypes_norm.shape[0]  # 原型数
         k = self.k_neighbors
         
-        for q in query_features:
-            # 计算查询与所有原型的距离（余弦距离）
-            # 归一化查询向量和原型
-            q_norm = q / (np.linalg.norm(q) + 1e-8)
-            prototypes_norm = self.prototypes / (np.linalg.norm(self.prototypes, axis=1, keepdims=True) + 1e-8)
-            # 计算余弦相似度
-            cosine_sims = np.dot(prototypes_norm, q_norm)
-            # 转换为余弦距离（1 - 余弦相似度）
-            dists = 1.0 - cosine_sims
+        # 决定使用 CPU 还是 GPU
+        use_gpu = device is not None and torch.cuda.is_available()
+        
+        # # 记录使用的设备
+        # if use_gpu:
+        #     logging.info(f"SOINN inference using GPU: {device} (query_samples={N}, prototypes={M}, k_neighbors={k})")
+        # else:
+        #     reason = "CUDA not available" if device is not None and not torch.cuda.is_available() else "device not specified"
+        #     logging.info(f"SOINN inference using CPU (query_samples={N}, prototypes={M}, k_neighbors={k}, reason={reason})")
+        
+        if use_gpu:
+            # GPU 加速版本
+            # 转换为 torch tensor
+            query_t = torch.from_numpy(query_features).float().to(device)  # [N, D]
+            prototypes_t = torch.from_numpy(self.prototype_labels).long().to(device)  # [M]
+            prototypes_norm_t = torch.from_numpy(self.prototypes_norm).float().to(device)  # [M, D]
             
-            # 找到最近的 K 个原型（K-NN）
-            k_indices = np.argsort(dists)[:min(k, len(dists))]
-            k_labels = self.prototype_labels[k_indices]
-            k_dists = dists[k_indices]
+            # 归一化查询特征
+            query_norm_t = torch.nn.functional.normalize(query_t, p=2, dim=1)  # [N, D]
             
-            # 使用 K-NN 投票：统计每个类别的票数（使用距离加权）
-            class_votes = {}  # {label: weighted_vote}
-            class_min_dist = {}  # {label: min_distance}
+            # 批量计算余弦相似度：[N, M] = [N, D] @ [D, M]
+            cosine_sims = torch.mm(query_norm_t, prototypes_norm_t.t())  # [N, M]
             
-            for label, dist in zip(k_labels, k_dists):
-                # 使用距离的倒数作为权重（距离越小权重越大）
-                weight = 1.0 / (dist + 1e-8)
-                if label not in class_votes:
-                    class_votes[label] = weight
-                    class_min_dist[label] = dist
-                else:
-                    class_votes[label] += weight
-                    class_min_dist[label] = min(class_min_dist[label], dist)
+            # 转换为余弦距离
+            dists = 1.0 - cosine_sims  # [N, M]
             
-            # 如果K-NN中没有覆盖所有类别，补充其他类别的信息（使用最小距离）
-            for i, label in enumerate(self.prototype_labels):
-                if label not in class_votes:
-                    class_min_dist[label] = dists[i]
+            # 找到每个查询的 K 个最近邻
+            k_dists, k_indices = torch.topk(dists, k=min(k, M), dim=1, largest=False)  # [N, k]
+            k_labels = prototypes_t[k_indices]  # [N, k]
             
-            # 排序：先按加权票数降序，再按最小距离升序
-            sorted_classes = sorted(class_votes.keys(), key=lambda c: (-class_votes[c], class_min_dist.get(c, float('inf'))))
+            # 计算权重（距离的倒数）
+            weights = 1.0 / (k_dists + 1e-8)  # [N, k]
             
-            # 如果还有其他类别没有出现在K-NN中，按最小距离排序后添加到末尾
-            other_classes = [c for c in range(total_classes) if c not in sorted_classes]
-            other_classes_sorted = sorted(other_classes, key=lambda c: class_min_dist.get(c, float('inf')))
-            sorted_classes.extend(other_classes_sorted)
+            # 在 GPU 上批量计算每个查询样本的每个类别的最小距离
+            # 使用 torch 操作避免传输完整距离矩阵到 CPU
+            class_min_dists_gpu = torch.full((N, total_classes), float('inf'), device=device, dtype=torch.float32)  # [N, total_classes]
             
-            # 取前 topk 个类别
-            top = sorted_classes[:topk]
+            # 批量计算每个类别的最小距离（使用分组操作）
+            # 对每个类别，找到属于该类别的所有原型，然后计算最小距离
+            all_unique_labels = torch.unique(prototypes_t)  # [C] 所有唯一类别
+            for cls in all_unique_labels:
+                cls_int = cls.item()
+                if cls_int >= total_classes:
+                    continue
+                # 找到属于该类别的所有原型索引
+                cls_mask = (prototypes_t == cls)  # [M]
+                if cls_mask.any():
+                    # 对每个查询样本，计算该类别的最小距离（批量操作）
+                    cls_dists = dists[:, cls_mask]  # [N, num_prototypes_of_cls]
+                    cls_min_dists = cls_dists.min(dim=1)[0]  # [N]
+                    class_min_dists_gpu[:, cls_int] = cls_min_dists
             
-            # 若类别数不足，补齐其它类别索引（不重复），保证输出形状一致
-            if len(top) < topk:
-                remaining = [c for c in range(total_classes) if c not in top]
-                top.extend(remaining[: topk - len(top)])
+            # 只传输必要的数据到 CPU：K 个最近邻信息和每个类别的最小距离
+            k_labels_cpu = k_labels.cpu().numpy()  # [N, k]
+            k_dists_cpu = k_dists.cpu().numpy()  # [N, k]
+            weights_cpu = weights.cpu().numpy()  # [N, k]
+            class_min_dists_cpu = class_min_dists_gpu.cpu().numpy()  # [N, total_classes]
             
-            preds.append(top)
-
-        return np.array(preds, dtype=np.int64)
+            # 对每个查询样本，统计每个类别的加权票数和最小距离
+            preds = []
+            for i in range(N):
+                # 当前查询的 K-NN 信息
+                labels_i = k_labels_cpu[i]  # [k]
+                dists_i = k_dists_cpu[i]  # [k]
+                weights_i = weights_cpu[i]  # [k]
+                
+                # 统计每个类别的加权票数和最小距离
+                class_votes = {}  # {label: weighted_vote}
+                class_min_dist = {}  # {label: min_distance}
+                
+                for label, dist, weight in zip(labels_i, dists_i, weights_i):
+                    if label not in class_votes:
+                        class_votes[label] = weight
+                        class_min_dist[label] = dist
+                    else:
+                        class_votes[label] += weight
+                        class_min_dist[label] = min(class_min_dist[label], dist)
+                
+                # 补充其他类别的最小距离（从 GPU 上计算的结果中获取）
+                for cls in range(total_classes):
+                    if cls not in class_votes:
+                        class_min_dist[cls] = class_min_dists_cpu[i, cls]
+                
+                # 排序：先按加权票数降序，再按最小距离升序
+                sorted_classes = sorted(class_votes.keys(), key=lambda c: (-class_votes[c], class_min_dist.get(c, float('inf'))))
+                
+                # 补充其他类别
+                other_classes = [c for c in range(total_classes) if c not in sorted_classes]
+                other_classes_sorted = sorted(other_classes, key=lambda c: class_min_dist.get(c, float('inf')))
+                sorted_classes.extend(other_classes_sorted)
+                
+                # 取前 topk
+                top = sorted_classes[:topk]
+                
+                # 补齐
+                if len(top) < topk:
+                    remaining = [c for c in range(total_classes) if c not in top]
+                    top.extend(remaining[: topk - len(top)])
+                
+                preds.append(top)
+            
+            return np.array(preds, dtype=np.int64)
+        else:
+            # CPU 版本（仍然使用矩阵运算优化）
+            # 归一化查询特征
+            query_norms = np.linalg.norm(query_features, axis=1, keepdims=True)
+            query_norm = query_features / (query_norms + 1e-8)  # [N, D]
+            
+            # 批量计算余弦相似度：[N, M] = [N, D] @ [D, M]
+            cosine_sims = np.dot(query_norm, self.prototypes_norm.T)  # [N, M]
+            
+            # 转换为余弦距离
+            dists = 1.0 - cosine_sims  # [N, M]
+            
+            # 找到每个查询的 K 个最近邻（使用 argpartition 优化）
+            k = min(k, M)
+            k_indices = np.argpartition(dists, k-1, axis=1)[:, :k]  # [N, k]
+            # 对每个查询的 k 个最近邻进行排序
+            for i in range(N):
+                k_indices[i] = k_indices[i][np.argsort(dists[i, k_indices[i]])]
+            
+            k_labels = self.prototype_labels[k_indices]  # [N, k]
+            k_dists = np.take_along_axis(dists, k_indices, axis=1)  # [N, k]
+            
+            # 计算权重
+            weights = 1.0 / (k_dists + 1e-8)  # [N, k]
+            
+            # 对每个查询样本，统计每个类别的加权票数和最小距离
+            preds = []
+            for i in range(N):
+                # 统计每个类别的加权票数和最小距离
+                class_votes = {}  # {label: weighted_vote}
+                class_min_dist = {}  # {label: min_distance}
+                
+                for label, dist, weight in zip(k_labels[i], k_dists[i], weights[i]):
+                    if label not in class_votes:
+                        class_votes[label] = weight
+                        class_min_dist[label] = dist
+                    else:
+                        class_votes[label] += weight
+                        class_min_dist[label] = min(class_min_dist[label], dist)
+                
+                # 补充其他类别的最小距离
+                for j, label in enumerate(self.prototype_labels):
+                    if label not in class_votes:
+                        class_min_dist[label] = dists[i, j]
+                
+                # 排序：先按加权票数降序，再按最小距离升序
+                sorted_classes = sorted(class_votes.keys(), key=lambda c: (-class_votes[c], class_min_dist.get(c, float('inf'))))
+                
+                # 补充其他类别
+                other_classes = [c for c in range(total_classes) if c not in sorted_classes]
+                other_classes_sorted = sorted(other_classes, key=lambda c: class_min_dist.get(c, float('inf')))
+                sorted_classes.extend(other_classes_sorted)
+                
+                # 取前 topk
+                top = sorted_classes[:topk]
+                
+                # 补齐
+                if len(top) < topk:
+                    remaining = [c for c in range(total_classes) if c not in top]
+                    top.extend(remaining[: topk - len(top)])
+                
+                preds.append(top)
+            
+            return np.array(preds, dtype=np.int64)
 
     def prototypes_per_class(self):
         """便捷方法: 获取每个类生成了多少原型"""

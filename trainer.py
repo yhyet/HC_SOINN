@@ -8,6 +8,7 @@ from utils.toolkit import count_parameters
 import os
 import numpy as np
 from datetime import datetime
+import time
 
 
 def train(args):
@@ -84,8 +85,36 @@ def _train(args):
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
-        model.incremental_train(data_manager)
-        eval_results = model.eval_task()
+        
+        # 记录最后一个 task 的训练和测试时间
+        is_last_task = (task == data_manager.nb_tasks - 1)
+        train_time = None
+        eval_time = None
+        
+        if is_last_task:
+            # 记录训练时间
+            train_start = time.time()
+            model.incremental_train(data_manager)
+            train_end = time.time()
+            train_time = train_end - train_start
+            
+            # 记录测试时间
+            eval_start = time.time()
+            eval_results = model.eval_task()
+            eval_end = time.time()
+            eval_time = eval_end - eval_start
+            
+            # 输出时间信息
+            logging.info("=" * 60)
+            logging.info("Last Task (Task {}) Time Statistics:".format(task))
+            logging.info("  Training time: {:.2f} seconds ({:.2f} minutes)".format(train_time, train_time / 60))
+            logging.info("  Evaluation time: {:.2f} seconds ({:.2f} minutes)".format(eval_time, eval_time / 60))
+            logging.info("  Total time: {:.2f} seconds ({:.2f} minutes)".format(train_time + eval_time, (train_time + eval_time) / 60))
+            logging.info("=" * 60)
+        else:
+            model.incremental_train(data_manager)
+            eval_results = model.eval_task()
+        
         model.after_task()
 
         # 处理FC分类器的结果

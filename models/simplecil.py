@@ -78,4 +78,15 @@ class Learner(BaseLearner):
         self._network.to(self._device)
         self.replace_fc(train_loader_for_protonet, self._network, None)
 
-   
+    def eval_task(self):
+        """
+        评估任务：使用FC分类器进行评估
+        返回字典格式，与trainer.py的期望一致
+        """
+        y_pred, y_true = self._eval_cnn(self.test_loader)
+        fc_accy = self._evaluate(y_pred, y_true)
+        
+        # 返回字典格式，key为"fc"表示这是FC分类器的结果
+        return {"fc": fc_accy}
+
+    

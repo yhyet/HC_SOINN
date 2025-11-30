@@ -12,6 +12,7 @@ from utils.inc_net import CodaPromptVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 from utils.knn_classifier import KNNClassifier
+from utils.soinn_classifier import SOINNClassifier
 import os
 
 # tune the model at first session with vpt, and then conduct simple shot.
@@ -42,6 +43,25 @@ class Learner(BaseLearner):
                 k_neighbors=args.get("knn_k", None),
             )
             logging.info(f"KNNClassifier initialized with metric: {self.knn.metric}")
+        
+        # SOINN plugin
+        self.use_soinn = args.get("use_soinn", False)
+        if self.use_soinn:
+            # 处理 seed 参数：如果传入的是列表，取第一个元素
+            seed = args.get("seed", None)
+            if isinstance(seed, (list, tuple)) and len(seed) > 0:
+                seed = seed[0]
+            
+            logging.info("Initializing SOINNClassifier")
+            self.soinn = SOINNClassifier(
+                ad=args.get("soinn_ad", 20),
+                lam=args.get("soinn_lam", 20),
+                max_nodes_per_class=args.get("soinn_max_nodes_per_class", None),
+                seed=seed,
+                threshold_scale=args.get("soinn_threshold_scale", 0.3),
+                k_neighbors=args.get("soinn_k_neighbors", 3),
+            )
+            logging.info(f"SOINNClassifier initialized with k_neighbors={self.soinn.k_neighbors}")
         
         total_params = sum(p.numel() for p in self._network.parameters())
         logging.info(f'{total_params:,} total parameters.')
@@ -167,6 +187,10 @@ class Learner(BaseLearner):
             else:
                 # 普通模式：使用所有已见过的任务重新提取特征（与upperbound一致，但会在评估时使用）
                 self._build_knn_bank()
+        
+        # 3. 构建SOINN bank
+        if getattr(self, "use_soinn", False):
+            self._build_soinn_bank()
         
         logging.info("All classifiers built successfully")
     
@@ -448,6 +472,98 @@ class Learner(BaseLearner):
         
         logging.info(f"KNN bank rebuilt in upperbound mode with {self._total_classes} classes using latest model features")
 
+    def _get_soinn_feature_fn(self):
+        """
+        获取SOINN特征提取函数（统一特征提取逻辑）
+        """
+        def feature_fn(x):
+            if isinstance(self._network, nn.DataParallel):
+                feats = self._network.module(x, pen=True, train=False)
+            else:
+                feats = self._network(x, pen=True, train=False)
+            
+            if isinstance(feats, tuple):
+                feats = feats[0]
+            
+            if not isinstance(feats, torch.Tensor):
+                raise TypeError(f"Expected tensor, got {type(feats)}")
+            
+            if len(feats.shape) == 1:
+                feats = feats.reshape(1, -1)
+            elif len(feats.shape) != 2:
+                raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+            
+            return feats
+        
+        return feature_fn
+
+    def _build_soinn_bank(self):
+        """
+        构建SOINN bank：累积存储机制
+        - 如果SOINN bank为空（首次任务或加载checkpoint后）：需要重建所有已见过的任务的features
+        - 如果SOINN bank不为空（正常训练）：保留之前任务的features，只添加当前任务新类别的features
+        - 这样符合增量学习的累积存储要求
+        """
+        # 判断是否需要重建所有features（首次任务或加载checkpoint后）
+        # 检查SOINN bank是否为空
+        soinn_bank_empty = (not hasattr(self.soinn, 'prototypes')) or (self.soinn.prototypes is None) or (len(self.soinn.prototypes) == 0)
+        
+        if soinn_bank_empty:
+            # 首次任务或加载checkpoint后：需要计算所有已见过的任务的features
+            logging.info(f"Building SOINN bank: computing all seen classes (0-{self._total_classes-1}) [first task or after checkpoint load]")
+            all_train_dataset = self.data_manager.get_dataset(
+                np.arange(0, self._total_classes), source="train", mode="test"
+            )
+            all_train_loader = DataLoader(
+                all_train_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=num_workers
+            )
+            
+            # 使用统一的特征提取函数
+            feature_fn = self._get_soinn_feature_fn()
+            
+            # 清空并重建所有features
+            self.soinn.clear()
+            with torch.no_grad():
+                self.soinn.add_from_loader(all_train_loader, feature_fn, self._device)
+            
+            # 打印每个类的原型数量
+            proto_info = self.soinn.prototypes_per_class()
+            logging.info(f"SOINN bank built: computed prototypes for {self._total_classes} classes")
+            logging.info(f"SOINN prototypes per class: {proto_info}")
+        else:
+            # 正常训练：累积存储机制 - 保留之前的features，只添加当前任务新类别的features
+            logging.info(f"Building SOINN bank: preserving previous prototypes, adding new classes ({self._known_classes}-{self._total_classes-1})")
+            
+            # 注意：不清空SOINN bank，保留之前的features（累积存储）
+            
+            # 使用统一的特征提取函数
+            feature_fn = self._get_soinn_feature_fn()
+            
+            # 只获取当前任务的训练数据（累积存储：过往features已存储在SOINN bank中）
+            current_task_dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes), source="train", mode="test"
+            )
+            current_task_loader = DataLoader(
+                current_task_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=num_workers
+            )
+            
+            # 只添加当前任务的特征到SOINN bank（累积存储：过往features已保留）
+            with torch.no_grad():
+                self.soinn.add_from_loader(current_task_loader, feature_fn, self._device)
+            
+            # 打印每个类的原型数量
+            proto_info = self.soinn.prototypes_per_class()
+            logging.info(f"SOINN bank updated: added prototypes for classes {self._known_classes}-{self._total_classes-1} (previous prototypes preserved)")
+            logging.info(f"SOINN prototypes per class: {proto_info}")
+
     def data_weighting(self):
         self.dw_k = torch.tensor(np.ones(self._total_classes + 1, dtype=np.float32))
         self.dw_k = self.dw_k.to(self._device)
@@ -575,9 +691,9 @@ class Learner(BaseLearner):
                 elif len(feats.shape) != 2:
                     raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
                 
-                # 转换为 numpy 并预测
+                # 转换为 numpy 并预测（启用 GPU 加速）
                 feats_np = feats.numpy()
-                topk_pred = self.knn.predict_topk(feats_np, self.topk, self._total_classes)
+                topk_pred = self.knn.predict_topk(feats_np, self.topk, self._total_classes, device=self._device)
                 y_pred.append(topk_pred)
                 y_true.append(targets.cpu().numpy())
         
@@ -615,6 +731,36 @@ class Learner(BaseLearner):
                 y_true.append(targets.cpu().numpy())
         return np.concatenate(y_pred), np.concatenate(y_true)
 
+    def _eval_soinn(self, loader):
+        """使用SOINN分类器进行评估"""
+        self._network.eval()
+        y_pred, y_true = [], []
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                # 提取特征（与训练时添加到SOINN bank的特征提取方式保持一致）
+                feature_fn = self._get_soinn_feature_fn()
+                feats = feature_fn(inputs)
+                
+                feats = feats.detach().cpu()
+                
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                elif len(feats.shape) != 2:
+                    raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+                
+                # 转换为 numpy 并预测（启用 GPU 加速）
+                feats_np = feats.numpy()
+                topk_pred = self.soinn.predict_topk(feats_np, self.topk, self._total_classes, device=self._device)
+                y_pred.append(topk_pred)
+                y_true.append(targets.cpu().numpy())
+        
+        if len(y_pred) == 0:
+            logging.warning("No predictions generated from SOINN evaluation")
+            return np.array([]), np.array([])
+        
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
     def eval_task(self):
         """
         评估任务：分别评估FC、KNN（如果启用）、NCM（如果启用）三种分类器
@@ -636,7 +782,12 @@ class Learner(BaseLearner):
             y_pred_knn, y_true_knn = self._eval_knn(self.test_loader)
             results["knn"] = self._evaluate(y_pred_knn, y_true_knn)
         
-        # 3. 使用NCM分类器评估（如果已计算类均值）
+        # 3. 使用SOINN分类器评估（如果启用）
+        if getattr(self, "use_soinn", False):
+            y_pred_soinn, y_true_soinn = self._eval_soinn(self.test_loader)
+            results["soinn"] = self._evaluate(y_pred_soinn, y_true_soinn)
+        
+        # 4. 使用NCM分类器评估（如果已计算类均值）
         if hasattr(self, "_class_means") and self._class_means is not None:
             y_pred_ncm, y_true_ncm = self._eval_ncm_fc(self.test_loader)
             results["ncm"] = self._evaluate(y_pred_ncm, y_true_ncm)

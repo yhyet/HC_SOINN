@@ -22,11 +22,16 @@ class Learner(BaseLearner):
         self._network = SimpleVitNetKNN(args, True)
         self.args = args
         # SOINN 分类器
+        # 处理 seed 参数：如果传入的是列表，取第一个元素
+        seed = args.get("seed", None)
+        if isinstance(seed, (list, tuple)) and len(seed) > 0:
+            seed = seed[0]
+        
         self.soinn = SOINNClassifier(
             ad=args.get("soinn_ad", 20),
             lam=args.get("soinn_lam", 20),
             max_nodes_per_class=args.get("soinn_max_nodes_per_class", None),
-            seed=args.get("seed", None),
+            seed=seed,
             threshold_scale=args.get("soinn_threshold_scale", 0.3),
             k_neighbors=args.get("soinn_k_neighbors", 3),
         )
@@ -132,8 +137,8 @@ class Learner(BaseLearner):
                 features = self._network.extract_vector(inputs)
                 features = tensor2numpy(features)
 
-                # 使用SOINN分类器进行预测
-                topk_pred = self.soinn.predict_topk(features, self.topk, self._total_classes)
+                # 使用SOINN分类器进行预测（传入 device 以启用 GPU 加速）
+                topk_pred = self.soinn.predict_topk(features, self.topk, self._total_classes, device=self._device)
                 y_pred.append(topk_pred)
                 y_true.append(targets.numpy())
 
