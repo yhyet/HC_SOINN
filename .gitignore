@@ -1,5 +1,6 @@
 data/
 logs/
+checkpoints/
 .idea/
 __pycache__/
 *.py[cod]
