@@ -20,9 +20,9 @@
     "optimizer": "sgd",
     "vpt_type": "shallow",
     "prompt_token_num": 3,
-    "knn_k": 11,
+    "knn_k": 5,
     "use_knn": true,
-    "knn_metric": "euclidean",
-    "knn_use_all": true
+    "knn_metric": "cosine",
+    "knn_use_all": false
 }
 

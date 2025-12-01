@@ -22,10 +22,10 @@
     "prompt_token_num": 3,
     
     "use_soinn": true,
-    "soinn_ad": 20,
-    "soinn_lam": 20,
+    "soinn_ad": 50,
+    "soinn_lam": 50,
     "soinn_max_nodes_per_class": null,
-    "soinn_threshold_scale": 0.3,
+    "soinn_threshold_scale": 0.75,
     "soinn_k_neighbors": 3
 }
 

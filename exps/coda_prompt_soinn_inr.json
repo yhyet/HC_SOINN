@@ -1,18 +1,18 @@
 {
     "prefix": " ",
-    "dataset": "cifar224",
+    "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": false,
-    "init_cls": 10,
-    "increment": 10,
+    "init_cls": 20,
+    "increment": 20,
     "model_name": "coda_prompt",
     "backbone_type": "vit_base_patch16_224_coda_prompt",
     "device": ["0"],
     "seed": [0],
-
-    "tuned_epoch": 20,
+    
+    "tuned_epoch": 50,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,
@@ -28,15 +28,15 @@
     "prompt_param": [100, 8.0, 0.0],
 
     "use_soinn": true,
-    "soinn_ad": 20,
-    "soinn_lam": 20,
+    "soinn_ad": 50,
+    "soinn_lam": 50,
     "soinn_max_nodes_per_class": null,
     "soinn_threshold_scale": 0.75,
-    "soinn_k_neighbors": 1,
+    "soinn_k_neighbors": 3,
 
     "save_checkpoint": true,
     "checkpoint_dir": "checkpoints",
-    "checkpoint_name": "coda_prompt_soinn",
+    "checkpoint_name": "coda_prompt_soinn_inr",
     "load_all_checkpoints": false
 }
 

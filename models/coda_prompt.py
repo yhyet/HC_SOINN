@@ -14,6 +14,10 @@ from utils.toolkit import tensor2numpy
 from utils.knn_classifier import KNNClassifier
 from utils.soinn_classifier import SOINNClassifier
 import os
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -78,6 +82,10 @@ class Learner(BaseLearner):
         # 保存checkpoint（每个任务训练完后）
         if self.args.get("save_checkpoint", False):
             self.save_checkpoint()
+        
+        # SOINN t-SNE 可视化（只在启用 SOINN 时执行）
+        if getattr(self, "use_soinn", False) and hasattr(self, "soinn"):
+            self._visualize_soinn_tsne()
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -838,6 +846,236 @@ class Learner(BaseLearner):
         
         torch.save(save_dict, checkpoint_path)
         logging.info(f"Checkpoint saved to {checkpoint_path}")
+
+    def _visualize_soinn_tsne(self):
+        """
+        SOINN t-SNE 可视化：对第一个 task 的 5 个类别进行可视化
+        每个 task 结束后都生成一张图片，显示样本点和 SOINN 节点
+        """
+        # 只对第一个 task 的类别进行可视化
+        init_cls = self.args.get("init_cls", 10)
+        if init_cls < 5:
+            logging.warning(f"Initial classes ({init_cls}) < 5, skipping SOINN visualization")
+            return
+        
+        # 选择前 5 个类别
+        target_classes = list(range(5))
+        
+        # 检查这些类别是否在 SOINN 中
+        if not hasattr(self.soinn, '_class_models'):
+            logging.warning("SOINN models not found, skipping visualization")
+            return
+        
+        available_classes = [cls for cls in target_classes if cls in self.soinn._class_models]
+        if len(available_classes) == 0:
+            logging.warning("No target classes found in SOINN, skipping visualization")
+            return
+        
+        # 获取第一个 task 的训练数据（用于提取样本特征）
+        if not hasattr(self, 'data_manager'):
+            logging.warning("DataManager not found, skipping visualization")
+            return
+        
+        try:
+            # 获取第一个 task 的 5 个类别的训练数据
+            train_dataset = self.data_manager.get_dataset(
+                np.arange(0, min(5, init_cls)), 
+                source="train", 
+                mode="test"  # 使用 test 模式关闭数据增强
+            )
+            train_loader = DataLoader(
+                train_dataset, 
+                batch_size=self.batch_size, 
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=num_workers
+            )
+            
+            # 提取样本特征
+            feature_fn = self._get_soinn_feature_fn()
+            sample_features = []
+            sample_labels = []
+            
+            self._network.eval()
+            with torch.no_grad():
+                for _, inputs, targets in train_loader:
+                    inputs = inputs.to(self._device)
+                    feats = feature_fn(inputs)
+                    feats_np = feats.detach().cpu().numpy()
+                    sample_features.append(feats_np)
+                    sample_labels.append(targets.numpy())
+            
+            sample_features = np.concatenate(sample_features, axis=0)
+            sample_labels = np.concatenate(sample_labels, axis=0)
+            
+            # 只保留前 5 个类别的样本
+            mask = np.isin(sample_labels, target_classes)
+            sample_features = sample_features[mask]
+            sample_labels = sample_labels[mask]
+            
+            if len(sample_features) == 0:
+                logging.warning("No samples found for target classes, skipping visualization")
+                return
+            
+            # 重要：归一化样本特征（与 SOINN 节点保持一致）
+            # SOINN 节点在训练时就已经归一化了，所以样本特征也需要归一化
+            sample_features = sample_features / (np.linalg.norm(sample_features, axis=1, keepdims=True) + 1e-8)
+            
+            # 收集 SOINN 节点和边信息
+            soinn_nodes = []
+            soinn_labels = []
+            soinn_edges = []  # [(node_idx1, node_idx2), ...] 全局索引
+            
+            node_offset = 0
+            for cls in available_classes:
+                model = self.soinn._class_models[cls]
+                if len(model.nodes) == 0:
+                    continue
+                
+                # 添加该类的所有节点
+                for node in model.nodes:
+                    soinn_nodes.append(node)
+                    soinn_labels.append(cls)
+                
+                # 添加该类的边（使用全局索引）
+                for node_i, neighbors in model.edges.items():
+                    for node_j in neighbors.keys():
+                        if node_j > node_i:  # 避免重复边
+                            global_i = node_offset + node_i
+                            global_j = node_offset + node_j
+                            soinn_edges.append((global_i, global_j))
+                
+                node_offset += len(model.nodes)
+            
+            if len(soinn_nodes) == 0:
+                logging.warning("No SOINN nodes found, skipping visualization")
+                return
+            
+            soinn_nodes = np.array(soinn_nodes)
+            
+            # 先验证高维空间中的实际距离（余弦距离）
+            # 注意：此时 sample_features 和 soinn_nodes 都已经归一化了
+            logging.info("Verifying distances between samples and SOINN nodes in high-dimensional space...")
+            for cls in available_classes:
+                cls_sample_mask = sample_labels == cls
+                if not np.any(cls_sample_mask):
+                    continue
+                cls_samples = sample_features[cls_sample_mask]
+                
+                # 找到该类别的 SOINN 节点
+                cls_soinn_mask = np.array(soinn_labels) == cls
+                if not np.any(cls_soinn_mask):
+                    continue
+                cls_soinn_nodes = soinn_nodes[cls_soinn_mask]
+                
+                # 计算每个样本到最近 SOINN 节点的余弦距离（都已归一化）
+                cosine_sims = np.dot(cls_samples, cls_soinn_nodes.T)  # [N_samples, N_nodes]
+                cosine_dists = 1.0 - cosine_sims  # 余弦距离
+                min_dists = cosine_dists.min(axis=1)  # 每个样本到最近节点的距离
+                
+                avg_min_dist = min_dists.mean()
+                logging.info(f"Class {cls}: Average cosine distance from samples to nearest SOINN node: {avg_min_dist:.4f} "
+                           f"(min={min_dists.min():.4f}, max={min_dists.max():.4f})")
+            
+            # 合并样本和节点特征（都已归一化）
+            all_features = np.vstack([sample_features, soinn_nodes])
+            all_labels = np.concatenate([sample_labels, np.array(soinn_labels)])
+            is_sample = np.concatenate([
+                np.ones(len(sample_features), dtype=bool),  # True 表示样本
+                np.zeros(len(soinn_nodes), dtype=bool)      # False 表示 SOINN 节点
+            ])
+            
+            # t-SNE 降维（所有特征已经归一化）
+            logging.info(f"Computing t-SNE for {len(all_features)} points (samples + SOINN nodes)...")
+            tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
+            embeddings = tsne.fit_transform(all_features)
+            
+            # 分离样本和节点的嵌入
+            sample_embeddings = embeddings[is_sample]
+            soinn_embeddings = embeddings[~is_sample]
+            sample_labels_plot = all_labels[is_sample]
+            soinn_labels_plot = all_labels[~is_sample]
+            
+            # 创建图形
+            plt.figure(figsize=(12, 10))
+            
+            # 为每个类别定义颜色
+            colors = plt.cm.tab10(np.linspace(0, 1, 10))[:5]  # 使用前 5 种颜色
+            
+            # 绘制样本点（圆点）
+            for cls in available_classes:
+                cls_mask = sample_labels_plot == cls
+                if np.any(cls_mask):
+                    plt.scatter(
+                        sample_embeddings[cls_mask, 0],
+                        sample_embeddings[cls_mask, 1],
+                        c=[colors[cls]],
+                        marker='o',
+                        s=30,
+                        alpha=0.6,
+                        label=f'Class {cls} (samples)',
+                        edgecolors='black',
+                        linewidths=0.5
+                    )
+            
+            # 绘制 SOINN 节点（x 标记）
+            for cls in available_classes:
+                cls_mask = soinn_labels_plot == cls
+                if np.any(cls_mask):
+                    plt.scatter(
+                        soinn_embeddings[cls_mask, 0],
+                        soinn_embeddings[cls_mask, 1],
+                        c=[colors[cls]],
+                        marker='x',
+                        s=100,
+                        alpha=0.8,
+                        label=f'Class {cls} (SOINN nodes)',
+                        linewidths=2
+                    )
+            
+            # 绘制边（连接 SOINN 节点）
+            # soinn_edges 中的索引是相对于 soinn_embeddings 的
+            # 需要映射到 all_features 中的位置
+            sample_count = len(sample_features)
+            for edge_i, edge_j in soinn_edges:
+                # edge_i 和 edge_j 是在 soinn_nodes 中的索引
+                # 在 all_features 中的位置是 sample_count + edge_i/j
+                global_i = sample_count + edge_i
+                global_j = sample_count + edge_j
+                if global_i < len(embeddings) and global_j < len(embeddings):
+                    plt.plot(
+                        [embeddings[global_i, 0], embeddings[global_j, 0]],
+                        [embeddings[global_i, 1], embeddings[global_j, 1]],
+                        'gray',
+                        alpha=0.3,
+                        linewidth=0.5
+                    )
+            
+            plt.title(f'SOINN t-SNE Visualization (Task {self._cur_task})', fontsize=14, fontweight='bold')
+            plt.xlabel('t-SNE Dimension 1', fontsize=12)
+            plt.ylabel('t-SNE Dimension 2', fontsize=12)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            # 保存图片
+            # 尝试从 args 中获取日志目录，如果没有则使用默认路径
+            model_name = self.args.get("model_name", "coda_prompt")
+            dataset = self.args.get("dataset", "cifar224")
+            init_cls = self.args.get("init_cls", 10)
+            increment = self.args.get("increment", 10)
+            
+            vis_dir = f"logs/{model_name}/{dataset}/{init_cls}/{increment}/soinn_visualizations"
+            os.makedirs(vis_dir, exist_ok=True)
+            
+            vis_path = os.path.join(vis_dir, f"tsne_task{self._cur_task}.png")
+            plt.savefig(vis_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logging.info(f"SOINN t-SNE visualization saved to {vis_path}")
+            
+        except Exception as e:
+            logging.error(f"Error in SOINN t-SNE visualization: {e}", exc_info=True)
 
     def load_checkpoint(self, checkpoint_path):
         """
