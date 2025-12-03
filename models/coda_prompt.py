@@ -36,6 +36,8 @@ class Learner(BaseLearner):
         # KNN plugin
         self.use_knn = args.get("use_knn", False)
         self.knn_upperbound = args.get("knn_upperbound", False)  # KNN上限测试模式
+        # 是否启用基于使用频率的渐进式剪枝（仅对当前 task 的类别执行）
+        self.knn_prune_zero_usage = args.get("knn_prune_zero_usage", False)
         if self.use_knn:
             knn_metric = args.get("knn_metric", "euclidean")
             logging.info(f"Initializing KNNClassifier with metric: {knn_metric}")
@@ -78,12 +80,35 @@ class Learner(BaseLearner):
         # 不需要在这里设置，CodaPromptVitNet 中已经有 feature_dim 属性
 
     def after_task(self):
+        """
+        每个 task 结束后的统一处理流程：
+        1. 在 eval 完成、下一个 task 训练开始之前，对“当前 task 的类别”执行基于使用频率的 KNN 渐进式剪枝（可选）；
+        2. 更新已知类别数；
+        3. 保存 checkpoint；
+        4. 执行 SOINN t-SNE 可视化（如果启用）。
+        """
+        # 1. 基于使用频率的渐进式剪枝（只剪当前 task 的类别，可通过开关控制）
+        if getattr(self, "use_knn", False) and getattr(self, "knn_prune_zero_usage", False):
+            try:
+                if hasattr(self, "knn") and hasattr(self.knn, "prune_zero_usage"):
+                    current_task_classes = list(range(self._known_classes, self._total_classes))
+                    if len(current_task_classes) > 0:
+                        logging.info(
+                            f"[coda_prompt] Pruning KNN nodes with zero usage for current task classes: "
+                            f"{current_task_classes} (task {self._cur_task})"
+                        )
+                        self.knn.prune_zero_usage(current_task_classes)
+            except Exception as e:
+                logging.error(f"Error during KNN prune_zero_usage in coda_prompt.after_task: {e}", exc_info=True)
+
+        # 2. 更新已知类别数
         self._known_classes = self._total_classes
-        # 保存checkpoint（每个任务训练完后）
+
+        # 3. 保存checkpoint（每个任务训练完后）
         if self.args.get("save_checkpoint", False):
             self.save_checkpoint()
         
-        # SOINN t-SNE 可视化（只在启用 SOINN 时执行）
+        # 4. SOINN t-SNE 可视化（只在启用 SOINN 时执行）
         if getattr(self, "use_soinn", False) and hasattr(self, "soinn"):
             self._visualize_soinn_tsne()
 
@@ -699,9 +724,11 @@ class Learner(BaseLearner):
                 elif len(feats.shape) != 2:
                     raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
                 
-                # 转换为 numpy 并预测（启用 GPU 加速）
+                # 转换为 numpy 并预测（启用 GPU 加速，并跟踪使用频率以支持节点剪枝）
                 feats_np = feats.numpy()
-                topk_pred = self.knn.predict_topk(feats_np, self.topk, self._total_classes, device=self._device)
+                topk_pred = self.knn.predict_topk(
+                    feats_np, self.topk, self._total_classes, device=self._device, track_usage=True
+                )
                 y_pred.append(topk_pred)
                 y_true.append(targets.cpu().numpy())
         

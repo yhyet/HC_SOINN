@@ -23,6 +23,8 @@
     "knn_k": 5,
     "use_knn": true,
     "knn_metric": "cosine",
-    "knn_use_all": false
+    "knn_use_all": false,
+
+    "knn_prune_zero_usage": true
 }
 

@@ -25,6 +25,8 @@ class Learner(BaseLearner):
         super().__init__(args)
         self._network = SimpleVitNetKNN(args, True)
         self.args = args
+        # 是否启用基于使用频率的渐进式剪枝
+        self.knn_prune_zero_usage = args.get("knn_prune_zero_usage", False)
         # 通用 KNN 分类器
         self.knn = KNNClassifier(
             metric=args.get("knn_metric", "euclidean"),
@@ -33,8 +35,34 @@ class Learner(BaseLearner):
         )
 
     def after_task(self):
+        """
+        每个 task 结束后的统一处理流程：
+        1. 在 eval 完成、下一个 task 训练开始之前，对“当前 task 的类别”执行基于使用频率的渐进式剪枝；
+        2. 更新已知类别数；
+        3. 执行 KNN t-SNE 可视化。
+
+        注意：
+        - 只对本 task 新引入的类别执行剪枝（区间 [self._known_classes, self._total_classes)）；
+        - 早期 task 的类别在后续 task 中不会再次被剪枝，以避免过度删除历史知识。
+        """
+        # 1. 基于使用频率的渐进式剪枝（只剪当前 task 的类别，可通过开关控制）
+        if getattr(self, "knn_prune_zero_usage", False):
+            try:
+                if hasattr(self, "knn") and hasattr(self.knn, "prune_zero_usage"):
+                    current_task_classes = list(range(self._known_classes, self._total_classes))
+                    if len(current_task_classes) > 0:
+                        logging.info(
+                            f"Pruning KNN nodes with zero usage for current task classes: "
+                            f"{current_task_classes} (task {self._cur_task})"
+                        )
+                        self.knn.prune_zero_usage(current_task_classes)
+            except Exception as e:
+                logging.error(f"Error during KNN prune_zero_usage in after_task: {e}", exc_info=True)
+
+        # 2. 更新已知类别数
         self._known_classes = self._total_classes
-        # KNN t-SNE 可视化（每个任务结束后执行）
+
+        # 3. KNN t-SNE 可视化（每个任务结束后执行）
         self._visualize_knn_tsne()
 
     def incremental_train(self, data_manager):

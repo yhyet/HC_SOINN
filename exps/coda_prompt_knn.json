@@ -32,6 +32,7 @@
     "knn_use_all": false,
     "knn_k": 5,
     "knn_upperbound": false,
+    "knn_prune_zero_usage": true,
 
     "save_checkpoint": true,
     "checkpoint_dir": "checkpoints",

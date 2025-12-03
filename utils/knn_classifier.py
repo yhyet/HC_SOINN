@@ -103,6 +103,68 @@ class KNNClassifier:
             f"KNN bank updated. Classes in bank: {sorted(list(self.class_to_features.keys()))}"
         )
 
+    def prune_zero_usage(self, class_ids: Optional[List[int]] = None) -> None:
+        """
+        按类别移除使用频率为 0 的 KNN 节点。
+
+        设计约定：
+        - 仅对调用方指定的类别执行剪枝（例如“当前 task 涉及的类别”）；
+        - 早期 task 的类别可以在后续 task 中不再被剪枝（由上层 Learner 控制传入的 class_ids）；
+        - 剪枝后会重置 bank_feats_norm，下次 _gather_bank 时会自动重建。
+
+        参数:
+        - class_ids: 需要执行剪枝的类别 id 列表；为 None 时默认对当前所有类别执行。
+        """
+        if class_ids is None:
+            class_ids = list(self.class_to_features.keys())
+
+        pruned_total = 0
+        remaining_total = 0
+
+        for cls in class_ids:
+            if cls not in self.class_to_features or cls not in self.usage_counts:
+                continue
+
+            chunks = self.class_to_features[cls]
+            if len(chunks) == 0:
+                continue
+
+            # 将该类的所有特征展平成一个数组，方便按 mask 过滤
+            feats = np.concatenate(chunks, axis=0)  # [Nc, D]
+            usage = self.usage_counts[cls]          # [Nc]
+
+            if usage.shape[0] != feats.shape[0]:
+                logging.warning(
+                    f"KNN prune_zero_usage: mismatch for class {cls}, "
+                    f"usage len={usage.shape[0]}, feats len={feats.shape[0]}. "
+                    f"Skip pruning for this class."
+                )
+                continue
+
+            mask = usage > 0
+            pruned = int((~mask).sum())
+            kept = int(mask.sum())
+
+            pruned_total += pruned
+            remaining_total += kept
+
+            if kept == 0:
+                # 该类所有节点都未被使用，直接清空
+                self.class_to_features[cls] = []
+                del self.usage_counts[cls]
+            else:
+                # 保留被使用过的节点，并将其存为单一 chunk
+                self.class_to_features[cls] = [feats[mask]]
+                self.usage_counts[cls] = usage[mask]
+
+        # 剪枝后需要清空预归一化缓存，下次 _gather_bank 会重新计算
+        if pruned_total > 0:
+            self.bank_feats_norm = None
+            logging.info(
+                f"KNN prune_zero_usage: pruned {pruned_total} nodes, "
+                f"remaining {remaining_total} nodes in classes {class_ids}"
+            )
+
     def _gather_bank(self):
         """
         将按类别分散存储的特征拼接为两个扁平数组：
