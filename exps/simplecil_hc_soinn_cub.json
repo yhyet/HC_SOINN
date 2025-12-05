@@ -1,17 +1,17 @@
 {
     "prefix": " ",
-    "dataset": "imagenetr",
+    "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": true,
-    "init_cls": 20,
-    "increment": 20,
-    "model_name": "simplecil_soinn",
+    "init_cls": 10,
+    "increment": 10,
+    "model_name": "simplecil_hc_soinn",
     "backbone_type": "pretrained_vit_b16_224",
     "device": ["0"],
     "seed": [1993],
-    
+
     "tuned_epoch": 0,
     "init_lr": 0.01,
     "batch_size": 256,
@@ -20,12 +20,13 @@
     "optimizer": "sgd",
     "vpt_type": "shallow",
     "prompt_token_num": 3,
-    
-    "use_soinn": true,
-    "soinn_ad": 10,
-    "soinn_lam": 10,
-    "soinn_max_nodes_per_class": null,
-    "soinn_threshold_scale": 0.3,
-    "soinn_k_neighbors": 3
+
+    "hcsoinn_max_proto_per_class": 20,
+    "hcsoinn_alpha": 0.5,
+    "hcsoinn_tau_merge": 0.2,
+    "hcsoinn_tau_reject": 2.0,
+    "hcsoinn_linkage": "average",
+    "hcsoinn_distance": "cosine"
 }
+
 

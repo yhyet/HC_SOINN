@@ -72,7 +72,8 @@ def _train(args):
     knn_curve = {"top1": [], "top5": []}
     ncm_curve = {"top1": [], "top5": []}
     soinn_curve = {"top1": [], "top5": []}
-    fc_matrix, knn_matrix, ncm_matrix, soinn_matrix = [], [], [], []
+    esoinn_curve = {"top1": [], "top5": []}
+    fc_matrix, knn_matrix, ncm_matrix, soinn_matrix, esoinn_matrix = [], [], [], [], []
 
     # 如果启用了自动加载所有checkpoint模式，从任务0开始遍历所有任务
     start_task = 0
@@ -157,6 +158,16 @@ def _train(args):
             soinn_curve["top1"].append(soinn_accy["top1"])
             soinn_curve["top5"].append(soinn_accy["top5"])
 
+        # 处理 ESOINN 分类器的结果
+        if "esoinn" in eval_results:
+            esoinn_accy = eval_results["esoinn"]
+            logging.info("ESOINN: {}".format(esoinn_accy["grouped"]))
+            esoinn_keys = [key for key in esoinn_accy["grouped"].keys() if '-' in key]
+            esoinn_values = [esoinn_accy["grouped"][key] for key in esoinn_keys]
+            esoinn_matrix.append(esoinn_values)
+            esoinn_curve["top1"].append(esoinn_accy["top1"])
+            esoinn_curve["top5"].append(esoinn_accy["top5"])
+
         # 统一输出所有分类器的精度曲线（只显示已启用的分类器）
         curves_to_log = []
         if "fc" in eval_results:
@@ -167,6 +178,8 @@ def _train(args):
             curves_to_log.append(("NCM", ncm_curve))
         if "soinn" in eval_results:
             curves_to_log.append(("SOINN", soinn_curve))
+        if "esoinn" in eval_results:
+            curves_to_log.append(("ESOINN", esoinn_curve))
 
         for name, curve in curves_to_log:
             logging.info("{} top1 curve: {}".format(name, curve["top1"]))
@@ -197,6 +210,12 @@ def _train(args):
             avg_accs.append(("SOINN", avg_soinn))
             print('Average Accuracy (SOINN):', avg_soinn)
             logging.info("Average Accuracy (SOINN): {}".format(avg_soinn))
+
+        if "esoinn" in eval_results and len(esoinn_curve["top1"]) > 0:
+            avg_esoinn = sum(esoinn_curve["top1"]) / len(esoinn_curve["top1"])
+            avg_accs.append(("ESOINN", avg_esoinn))
+            print('Average Accuracy (ESOINN):', avg_esoinn)
+            logging.info("Average Accuracy (ESOINN): {}".format(avg_esoinn))
 
         logging.info("")  # 空行分隔
 
@@ -241,6 +260,16 @@ def _train(args):
             print('Accuracy Matrix (SOINN):')
             print(np_acctable)
             logging.info('Forgetting (SOINN): {}'.format(forgetting))
+        if len(esoinn_matrix) > 0:
+            np_acctable = np.zeros([task + 1, task + 1])
+            for idxx, line in enumerate(esoinn_matrix):
+                idxy = len(line)
+                np_acctable[idxx, :idxy] = np.array(line)
+            np_acctable = np_acctable.T
+            forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
+            print('Accuracy Matrix (ESOINN):')
+            print(np_acctable)
+            logging.info('Forgetting (ESOINN): {}'.format(forgetting))
 
 
 def _set_device(args):

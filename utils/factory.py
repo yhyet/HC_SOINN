@@ -6,6 +6,10 @@ def get_model(model_name, args):
         from models.simplecil_knn import Learner
     elif name == "simplecil_soinn":
         from models.simplecil_soinn import Learner
+    elif name == "simplecil_esoinn":
+        from models.simplecil_esoinn import Learner
+    elif name == "simplecil_hc_soinn":
+        from models.simplecil_hc_soinn import Learner
     elif name == "aper_finetune":
         from models.aper_finetune import Learner
     elif name == "aper_ssf":

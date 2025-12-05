@@ -7,7 +7,7 @@
     "shuffle": true,
     "init_cls": 20,
     "increment": 20,
-    "model_name": "simplecil_soinn",
+    "model_name": "simplecil_esoinn",
     "backbone_type": "pretrained_vit_b16_224",
     "device": ["0"],
     "seed": [1993],
@@ -20,12 +20,11 @@
     "optimizer": "sgd",
     "vpt_type": "shallow",
     "prompt_token_num": 3,
-    
-    "use_soinn": true,
-    "soinn_ad": 10,
-    "soinn_lam": 10,
-    "soinn_max_nodes_per_class": null,
-    "soinn_threshold_scale": 0.3,
-    "soinn_k_neighbors": 3
+
+    "use_esoinn": true,
+    "esoinn_max_edge_age": 50,
+    "esoinn_iter_threshold": 100,
+    "esoinn_c1": 0.001
 }
+
 
