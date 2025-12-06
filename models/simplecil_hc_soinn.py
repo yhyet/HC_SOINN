@@ -150,7 +150,7 @@ class Learner(BaseLearner):
         """
         y_pred, y_true = self._eval_cnn(self.test_loader)
         acc = self._evaluate(y_pred, y_true)
-        # 使用 "soinn" 作为 key 以复用 trainer.py 现有日志与曲线汇总逻辑
-        return {"soinn": acc}
+        # 使用 "hc_soinn" 作为 key 以在日志中正确显示 HC-SOINN
+        return {"hc_soinn": acc}
 
 

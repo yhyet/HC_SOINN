@@ -73,7 +73,8 @@ def _train(args):
     ncm_curve = {"top1": [], "top5": []}
     soinn_curve = {"top1": [], "top5": []}
     esoinn_curve = {"top1": [], "top5": []}
-    fc_matrix, knn_matrix, ncm_matrix, soinn_matrix, esoinn_matrix = [], [], [], [], []
+    hc_soinn_curve = {"top1": [], "top5": []}
+    fc_matrix, knn_matrix, ncm_matrix, soinn_matrix, esoinn_matrix, hc_soinn_matrix = [], [], [], [], [], []
 
     # 如果启用了自动加载所有checkpoint模式，从任务0开始遍历所有任务
     start_task = 0
@@ -168,6 +169,16 @@ def _train(args):
             esoinn_curve["top1"].append(esoinn_accy["top1"])
             esoinn_curve["top5"].append(esoinn_accy["top5"])
 
+        # 处理 HC-SOINN 分类器的结果
+        if "hc_soinn" in eval_results:
+            hc_soinn_accy = eval_results["hc_soinn"]
+            logging.info("HC-SOINN: {}".format(hc_soinn_accy["grouped"]))
+            hc_soinn_keys = [key for key in hc_soinn_accy["grouped"].keys() if '-' in key]
+            hc_soinn_values = [hc_soinn_accy["grouped"][key] for key in hc_soinn_keys]
+            hc_soinn_matrix.append(hc_soinn_values)
+            hc_soinn_curve["top1"].append(hc_soinn_accy["top1"])
+            hc_soinn_curve["top5"].append(hc_soinn_accy["top5"])
+
         # 统一输出所有分类器的精度曲线（只显示已启用的分类器）
         curves_to_log = []
         if "fc" in eval_results:
@@ -180,6 +191,8 @@ def _train(args):
             curves_to_log.append(("SOINN", soinn_curve))
         if "esoinn" in eval_results:
             curves_to_log.append(("ESOINN", esoinn_curve))
+        if "hc_soinn" in eval_results:
+            curves_to_log.append(("HC-SOINN", hc_soinn_curve))
 
         for name, curve in curves_to_log:
             logging.info("{} top1 curve: {}".format(name, curve["top1"]))
@@ -216,6 +229,12 @@ def _train(args):
             avg_accs.append(("ESOINN", avg_esoinn))
             print('Average Accuracy (ESOINN):', avg_esoinn)
             logging.info("Average Accuracy (ESOINN): {}".format(avg_esoinn))
+
+        if "hc_soinn" in eval_results and len(hc_soinn_curve["top1"]) > 0:
+            avg_hc_soinn = sum(hc_soinn_curve["top1"]) / len(hc_soinn_curve["top1"])
+            avg_accs.append(("HC-SOINN", avg_hc_soinn))
+            print('Average Accuracy (HC-SOINN):', avg_hc_soinn)
+            logging.info("Average Accuracy (HC-SOINN): {}".format(avg_hc_soinn))
 
         logging.info("")  # 空行分隔
 
@@ -270,6 +289,16 @@ def _train(args):
             print('Accuracy Matrix (ESOINN):')
             print(np_acctable)
             logging.info('Forgetting (ESOINN): {}'.format(forgetting))
+        if len(hc_soinn_matrix) > 0:
+            np_acctable = np.zeros([task + 1, task + 1])
+            for idxx, line in enumerate(hc_soinn_matrix):
+                idxy = len(line)
+                np_acctable[idxx, :idxy] = np.array(line)
+            np_acctable = np_acctable.T
+            forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
+            print('Accuracy Matrix (HC-SOINN):')
+            print(np_acctable)
+            logging.info('Forgetting (HC-SOINN): {}'.format(forgetting))
 
 
 def _set_device(args):

@@ -13,6 +13,7 @@ from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 from utils.knn_classifier import KNNClassifier
 from utils.soinn_classifier import SOINNClassifier
+from utils.hc_soinn_classifier import HCSOINNClassifier
 import os
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
@@ -50,9 +51,20 @@ class Learner(BaseLearner):
             )
             logging.info(f"KNNClassifier initialized with metric: {self.knn.metric}")
         
-        # SOINN plugin
-        self.use_soinn = args.get("use_soinn", False)
-        if self.use_soinn:
+        # SOINN / HC-SOINN plugins（互斥，优先 HC-SOINN）
+        self.use_hc_soinn = args.get("use_hc_soinn", False)
+        self.use_soinn = args.get("use_soinn", False) and not self.use_hc_soinn
+        if self.use_hc_soinn:
+            logging.info("Initializing HC-SOINNClassifier")
+            self.hc_soinn = HCSOINNClassifier(
+                max_prototypes_per_class=args.get("hcsoinn_max_proto_per_class", 20),
+                alpha=args.get("hcsoinn_alpha", 0.5),
+                tau_merge=args.get("hcsoinn_tau_merge", 0.2),
+                tau_reject=args.get("hcsoinn_tau_reject", 2.0),
+                linkage_method=args.get("hcsoinn_linkage", "average"),
+                distance_metric=args.get("hcsoinn_distance", "cosine"),
+            )
+        elif self.use_soinn:
             # 处理 seed 参数：如果传入的是列表，取第一个元素
             seed = args.get("seed", None)
             if isinstance(seed, (list, tuple)) and len(seed) > 0:
@@ -221,8 +233,10 @@ class Learner(BaseLearner):
                 # 普通模式：使用所有已见过的任务重新提取特征（与upperbound一致，但会在评估时使用）
                 self._build_knn_bank()
         
-        # 3. 构建SOINN bank
-        if getattr(self, "use_soinn", False):
+        # 3. 构建 HC-SOINN / SOINN bank（互斥）
+        if getattr(self, "use_hc_soinn", False):
+            self._build_hc_soinn_bank()
+        elif getattr(self, "use_soinn", False):
             self._build_soinn_bank()
         
         logging.info("All classifiers built successfully")
@@ -597,6 +611,53 @@ class Learner(BaseLearner):
             logging.info(f"SOINN bank updated: added prototypes for classes {self._known_classes}-{self._total_classes-1} (previous prototypes preserved)")
             logging.info(f"SOINN prototypes per class: {proto_info}")
 
+    def _build_hc_soinn_bank(self):
+        """
+        构建 HC-SOINN bank：类增量学习场景下的累积存储
+        - 每个任务只使用当前任务的新类别训练数据（符合类增量学习设定）
+        - 旧类别的信息通过已保存的簇中心保留（在 compress 时合并）
+        """
+        hc_bank_empty = (not hasattr(self, "hc_soinn")) or (len(getattr(self.hc_soinn, "class_clusters", {})) == 0)
+        if hc_bank_empty:
+            logging.info(f"HC-SOINN bank is empty!!!")
+        feature_fn = self._get_soinn_feature_fn()
+
+        def add_from_loader(loader):
+            feats, lbs = [], []
+            with torch.no_grad():
+                for _, inputs, targets in loader:
+                    inputs = inputs.to(self._device)
+                    batch_feats = feature_fn(inputs)
+                    if isinstance(batch_feats, torch.Tensor):
+                        batch_feats = batch_feats.detach().cpu().numpy()
+                    lbs.append(targets.numpy())
+                    feats.append(batch_feats)
+            if len(feats) == 0:
+                return
+            feats_np = np.concatenate(feats, axis=0)
+            lbs_np = np.concatenate(lbs, axis=0)
+            self.hc_soinn.add_features(feats_np, lbs_np)
+
+        # 类增量学习：每个任务只使用当前任务的新类别训练数据
+        logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
+        current_task_dataset = self.data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes), source="train", mode="test"
+        )
+        current_task_loader = DataLoader(
+            current_task_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+        )
+        add_from_loader(current_task_loader)
+
+        # 每个任务结束后压缩一次
+        try:
+            self.hc_soinn.compress()
+        except Exception as e:
+            logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
+
     def data_weighting(self):
         self.dw_k = torch.tensor(np.ones(self._total_classes + 1, dtype=np.float32))
         self.dw_k = self.dw_k.to(self._device)
@@ -796,6 +857,33 @@ class Learner(BaseLearner):
         
         return np.concatenate(y_pred), np.concatenate(y_true)
 
+    def _eval_hc_soinn(self, loader):
+        """使用 HC-SOINN 分类器进行评估"""
+        self._network.eval()
+        y_pred, y_true = [], []
+        feature_fn = self._get_soinn_feature_fn()
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                feats = feature_fn(inputs)
+                feats = feats.detach().cpu()
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                elif len(feats.shape) != 2:
+                    raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+                feats_np = feats.numpy()
+                topk_pred = self.hc_soinn.predict_topk(
+                    feats_np, self.topk, self._total_classes, device=self._device
+                )
+                y_pred.append(topk_pred)
+                y_true.append(targets.cpu().numpy())
+
+        if len(y_pred) == 0:
+            logging.warning("No predictions generated from HC-SOINN evaluation")
+            return np.array([]), np.array([])
+
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
     def eval_task(self):
         """
         评估任务：分别评估FC、KNN（如果启用）、NCM（如果启用）三种分类器
@@ -817,8 +905,11 @@ class Learner(BaseLearner):
             y_pred_knn, y_true_knn = self._eval_knn(self.test_loader)
             results["knn"] = self._evaluate(y_pred_knn, y_true_knn)
         
-        # 3. 使用SOINN分类器评估（如果启用）
-        if getattr(self, "use_soinn", False):
+        # 3. 使用 HC-SOINN / SOINN 分类器评估（互斥）
+        if getattr(self, "use_hc_soinn", False):
+            y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
+            results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
+        elif getattr(self, "use_soinn", False):
             y_pred_soinn, y_true_soinn = self._eval_soinn(self.test_loader)
             results["soinn"] = self._evaluate(y_pred_soinn, y_true_soinn)
         
