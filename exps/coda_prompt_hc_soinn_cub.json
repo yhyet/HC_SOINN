@@ -1,10 +1,10 @@
 {
-    "prefix": " ",
+    "prefix": "hcsoinn_star",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
-    "shuffle": false,
+    "shuffle": true,
     "init_cls": 10,
     "increment": 10,
     "model_name": "coda_prompt",
@@ -38,6 +38,8 @@
     "save_checkpoint": true,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_hc_soinn_cub",
-    "load_all_checkpoints": false
-}
+    "load_all_checkpoints": false,
 
+    "use_feature_alignment": true,
+    "alignment_k": 15
+}

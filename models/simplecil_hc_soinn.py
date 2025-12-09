@@ -35,6 +35,11 @@ class Learner(BaseLearner):
             tau_reject=args.get("hcsoinn_tau_reject", 2.0),
             linkage_method=args.get("hcsoinn_linkage", "average"),
             distance_metric=args.get("hcsoinn_distance", "cosine"),
+            use_soinn_refinement=args.get("hcsoinn_use_soinn_refinement", True),
+            soinn_ad=args.get("hcsoinn_soinn_ad", 20),
+            soinn_lam=args.get("hcsoinn_soinn_lam", 20),
+            soinn_threshold_scale=args.get("hcsoinn_soinn_threshold_scale", 0.5),
+            soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
         )
 
     def after_task(self):

@@ -63,6 +63,11 @@ class Learner(BaseLearner):
                 tau_reject=args.get("hcsoinn_tau_reject", 2.0),
                 linkage_method=args.get("hcsoinn_linkage", "average"),
                 distance_metric=args.get("hcsoinn_distance", "cosine"),
+                use_soinn_refinement=args.get("hcsoinn_use_soinn_refinement", True),
+                soinn_ad=args.get("hcsoinn_soinn_ad", 20),
+                soinn_lam=args.get("hcsoinn_soinn_lam", 20),
+                soinn_threshold_scale=args.get("hcsoinn_soinn_threshold_scale", 0.5),
+                soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
             )
         elif self.use_soinn:
             # 处理 seed 参数：如果传入的是列表，取第一个元素
@@ -86,6 +91,11 @@ class Learner(BaseLearner):
         total_trainable_params = sum(p.numel() for p in self._network.fc.parameters() if p.requires_grad) + sum(p.numel() for p in self._network.prompt.parameters() if p.requires_grad)
         logging.info(f'{total_trainable_params:,} fc and prompt training parameters.')
         
+        # HC-SOINN 特征漂移对齐配置
+        self.use_feature_alignment = args.get("use_feature_alignment", False)
+        self.alignment_k = args.get("alignment_k", 5)
+        self._class_anchors = {} # {cls: {'images': tensor, 'feats': numpy}}
+
         # NCM分类器：初始化类均值存储
         self._class_means = None
         # feature_dim 是 BaseLearner 的 @property，会从 self._network.feature_dim 获取
@@ -94,12 +104,27 @@ class Learner(BaseLearner):
     def after_task(self):
         """
         每个 task 结束后的统一处理流程：
-        1. 在 eval 完成、下一个 task 训练开始之前，对“当前 task 的类别”执行基于使用频率的 KNN 渐进式剪枝（可选）；
-        2. 更新已知类别数；
-        3. 保存 checkpoint；
-        4. 执行 SOINN t-SNE 可视化（如果启用）。
+        1. 漂移对齐（Feature Alignment）：对旧类别的 SOINN 节点进行刚性变换校正
+        2. 压缩（Compress）：对当前任务的数据生成 SOINN 节点
+        3. 锚点选择（Anchor Selection）：为当前任务选择锚点用于未来的漂移对齐
+        4. 其他清理工作
         """
-        # 1. 基于使用频率的渐进式剪枝（只剪当前 task 的类别，可通过开关控制）
+        # 1. 特征漂移对齐（针对旧类别）
+        if self.use_feature_alignment and self.use_hc_soinn:
+            self._compute_and_apply_drift()
+
+        # 2. 压缩 HC-SOINN（生成当前任务的节点）
+        if self.use_hc_soinn:
+            try:
+                self.hc_soinn.compress()
+            except Exception as e:
+                logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
+                
+        # 3. 为当前任务选择锚点（用于下一轮对齐）
+        if self.use_feature_alignment and self.use_hc_soinn:
+            self._select_and_store_anchors()
+
+        # 4. 基于使用频率的渐进式剪枝（只剪当前 task 的类别，可通过开关控制）
         if getattr(self, "use_knn", False) and getattr(self, "knn_prune_zero_usage", False):
             try:
                 if hasattr(self, "knn") and hasattr(self.knn, "prune_zero_usage"):
@@ -113,16 +138,149 @@ class Learner(BaseLearner):
             except Exception as e:
                 logging.error(f"Error during KNN prune_zero_usage in coda_prompt.after_task: {e}", exc_info=True)
 
-        # 2. 更新已知类别数
+        # 5. 更新已知类别数
         self._known_classes = self._total_classes
 
-        # 3. 保存checkpoint（每个任务训练完后）
+        # 6. 保存checkpoint（每个任务训练完后）
         if self.args.get("save_checkpoint", False):
             self.save_checkpoint()
         
-        # 4. SOINN t-SNE 可视化（只在启用 SOINN 时执行）
+        # 7. SOINN t-SNE 可视化（如果启用）
         if getattr(self, "use_soinn", False) and hasattr(self, "soinn"):
             self._visualize_soinn_tsne()
+
+    def _compute_and_apply_drift(self):
+        """
+        计算并应用特征漂移校正（基于 Procrustes Analysis 的刚性变换）
+        """
+        if self._cur_task == 0 or len(self._class_anchors) == 0:
+            return
+
+        logging.info("[Feature Alignment] Starting drift estimation and alignment...")
+        self._network.eval()
+        feature_fn = self._get_soinn_feature_fn()
+
+        aligned_count = 0
+        for cls, data in self._class_anchors.items():
+            # 1. 获取旧特征 (cached F_old, 基于上一轮模型)
+            feats_old = data["feats"] # [K, D]
+            imgs = data["images"]     # [K, C, H, W]
+            
+            # 2. 计算新特征 (F_new, 基于当前模型)
+            with torch.no_grad():
+                imgs = imgs.to(self._device)
+                feats_new = feature_fn(imgs) # [K, D]
+                if isinstance(feats_new, torch.Tensor):
+                    feats_new = feats_new.cpu().numpy()
+            
+            # 3. Procrustes Analysis 求解变换矩阵
+            # 目标：找到旋转 R 和平移 t，使得 F_new ~ (F_old - mu_old) @ R + mu_new
+            
+            mu_old = feats_old.mean(axis=0)
+            mu_new = feats_new.mean(axis=0)
+            
+            X_old = feats_old - mu_old
+            X_new = feats_new - mu_new
+            
+            # SVD: M = A^T @ B
+            # A=X_old, B=X_new
+            M = np.dot(X_old.T, X_new)
+            U, _, Vt = np.linalg.svd(M)
+            
+            # R = U @ Vt (这里 R 是正交矩阵)
+            # R = np.dot(U, Vt)
+            
+            # 计算旧特征的平均模长作为 proxy_scale
+            # feats_old 是原始特征（未归一化）
+            norms_old = np.linalg.norm(feats_old, axis=1)
+            proxy_scale = float(np.mean(norms_old))
+            if proxy_scale < 1e-6:
+                proxy_scale = 1.0
+            
+            # 4. 应用变换到 HC-SOINN 节点
+            # 传入 R=None (仅做平移对齐，避免旋转估计误差)
+            self.hc_soinn.apply_rigid_transform(cls, None, mu_old, mu_new, proxy_scale)
+            
+            # 5. 更新缓存的特征 (作为下一轮的 F_old)
+            self._class_anchors[cls]["feats"] = feats_new
+            aligned_count += 1
+            
+        logging.info(f"[Feature Alignment] Aligned {aligned_count} classes.")
+
+    def _select_and_store_anchors(self):
+        """
+        为当前任务的类别选择并存储锚点
+        策略：基于 HC-SOINN 拓扑骨架 (Top-K Nodes) 的最近邻样本
+        """
+        logging.info("[Feature Alignment] Selecting anchors for current task...")
+        self._network.eval()
+        feature_fn = self._get_soinn_feature_fn()
+        
+        # 获取当前任务的所有训练数据（无数据增强）
+        dataset = self.data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes), 
+            source="train", mode="test"
+        )
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
+        
+        # 提取特征用于最近邻搜索
+        all_feats = []
+        all_imgs = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs = inputs.to(self._device)
+                feats = feature_fn(inputs)
+                if isinstance(feats, torch.Tensor):
+                    feats = feats.cpu().numpy()
+                all_feats.append(feats)
+                all_imgs.append(inputs.cpu()) 
+                all_targets.append(targets.cpu().numpy())
+                
+        if len(all_feats) == 0:
+            return
+
+        all_feats = np.concatenate(all_feats, axis=0)
+        all_imgs = torch.cat(all_imgs, dim=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        
+        # 为每个新类选择锚点
+        current_classes = np.unique(all_targets)
+        for cls in current_classes:
+            # 获取 Top-K 节点中心
+            centers, counts = self.hc_soinn.get_class_prototypes_info(cls, k=self.alignment_k)
+            if len(centers) == 0:
+                continue
+                
+            cls_mask = (all_targets == cls)
+            cls_feats = all_feats[cls_mask]
+            cls_imgs_tensor = all_imgs[cls_mask]
+            
+            if len(cls_feats) == 0:
+                continue
+
+            anchors_imgs = []
+            anchors_feats = []
+            
+            # 归一化样本特征用于余弦相似度计算 (因为节点中心是归一化的)
+            cls_feats_norm = cls_feats / (np.linalg.norm(cls_feats, axis=1, keepdims=True) + 1e-8)
+            
+            for center in centers:
+                # 找最近邻
+                sims = np.dot(cls_feats_norm, center)
+                best_idx = np.argmax(sims)
+                
+                anchors_imgs.append(cls_imgs_tensor[best_idx])
+                anchors_feats.append(cls_feats[best_idx]) # 保存原始特征
+                
+            self._class_anchors[cls] = {
+                "images": torch.stack(anchors_imgs),
+                "feats": np.stack(anchors_feats)
+            }
+            
+        logging.info(f"[Feature Alignment] Anchors stored for classes: {current_classes}")
+
 
     def incremental_train(self, data_manager):
         self._cur_task += 1

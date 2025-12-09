@@ -1,5 +1,5 @@
 {
-    "prefix": " ",
+    "prefix": " hcsoinn_star",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -38,6 +38,10 @@
     "save_checkpoint": true,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_hc_soinn_cifar",
-    "load_all_checkpoints": false
+    "load_all_checkpoints": false,
+
+
+    "use_feature_alignment": true,
+    "alignment_k": 15
 }
 
