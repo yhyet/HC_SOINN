@@ -21,7 +21,7 @@
     "vpt_type": "shallow",
     "prompt_token_num": 3,
 
-    "hcsoinn_max_proto_per_class": 20,
+    "hcsoinn_max_proto_per_class": 60,
     "hcsoinn_alpha": 0.5,
     "hcsoinn_tau_merge": 0.2,
     "hcsoinn_tau_reject": 2.0,
@@ -30,8 +30,8 @@
     "hcsoinn_use_soinn_refinement": true,
     "hcsoinn_soinn_ad": 20,
     "hcsoinn_soinn_lam": 20,
-    "hcsoinn_soinn_threshold_scale": 0.5,
-    "hcsoinn_soinn_max_iter": 3
+    "hcsoinn_soinn_threshold_scale": 0.8,
+    "hcsoinn_soinn_max_iter": 1
 }
 
 

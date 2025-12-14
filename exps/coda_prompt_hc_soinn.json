@@ -1,5 +1,5 @@
 {
-    "prefix": " hcsoinn_star",
+    "prefix": "5epoch_star",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -12,7 +12,7 @@
     "device": ["0"],
     "seed": [0],
     
-    "tuned_epoch": 20,
+    "tuned_epoch": 5,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,
@@ -34,6 +34,11 @@
     "hcsoinn_tau_reject": 2.0,
     "hcsoinn_linkage": "average",
     "hcsoinn_distance": "cosine",
+    "hcsoinn_use_soinn_refinement": true,
+    "hcsoinn_soinn_ad": 20,
+    "hcsoinn_soinn_lam": 20,
+    "hcsoinn_soinn_threshold_scale": 0.5,
+    "hcsoinn_soinn_max_iter": 3,
 
     "save_checkpoint": true,
     "checkpoint_dir": "checkpoints",

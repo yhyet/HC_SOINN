@@ -15,7 +15,7 @@ HC-SOINN 分类器（Hierarchical-Cluster SOINN）
 - 压缩加速：compress 使用 ProcessPoolExecutor 多进程并行处理各类聚类
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -130,6 +130,7 @@ def _simplified_soinn_on_clusters(
     lam: int = 20,
     threshold_scale: float = 0.5,
     max_iterations: int = 3,
+    max_degree_for_removal: int = 1,
 ) -> List[_Cluster]:
     """
     在簇中心上应用简化版 SOINN 自组织机制
@@ -137,25 +138,30 @@ def _simplified_soinn_on_clusters(
     参数:
         cluster_centers: 簇中心列表 [M, D]
         cluster_counts: 每个簇的样本计数 [M]
-        ad: 边最大年龄
-        lam: 每 lam 次迭代删除孤立节点
-        threshold_scale: 阈值缩放因子
-        max_iterations: 最大迭代轮数（因为簇中心数量少，可以多轮迭代）
+        ad: 边最大年龄（越小，边越容易被删除，节点越容易被删除）
+        lam: 每 lam 次迭代删除孤立节点（在当前实现中，改为每轮迭代结束后删除）
+        threshold_scale: 阈值缩放因子（影响插入判断，当前实现中不插入新节点）
+        max_iterations: 最大迭代轮数（越多，边老化机会越多，节点越容易被删除）
+        max_degree_for_removal: 删除节点的最大度阈值（度 <= max_degree_for_removal 的节点会被删除）
+                              默认1（孤立节点或尾部节点），可以设为2使其更激进
     
     返回:
-        经过自组织调整后的簇列表
+        (clusters, edges): 经过自组织调整后的簇列表和边信息
+        - clusters: List[_Cluster]
+        - edges: Dict[int, Set[int]] 节点索引到邻居集合的映射
     """
     if len(cluster_centers) == 0:
-        return []
+        return [], {}
     if len(cluster_centers) == 1:
-        return [_Cluster(cluster_centers[0], cluster_counts[0])]
+        return [_Cluster(cluster_centers[0], cluster_counts[0])], {}
     
     # 初始化：所有簇中心作为节点
     nodes = [_normalize(c.copy()) for c in cluster_centers]
     win_counts = cluster_counts.copy()
     edges = defaultdict(dict)
     
-    # 初始化边：为每个节点找到最近的邻居建立连接
+    # 初始化边：为每个节点找到最近的 1 个邻居建立连接
+    # 只连接最近邻居可以减少初始连接数，使边老化后节点更容易被删除，删除更平滑
     n_nodes = len(nodes)
     if n_nodes >= 2:
         for i in range(n_nodes):
@@ -166,7 +172,9 @@ def _simplified_soinn_on_clusters(
                     dists.append(_cosine_distance(nodes[i], nodes[j]))
                     indices.append(j)
             if len(dists) > 0:
-                nearest_idx = np.argmin(dists)
+                # 只连接最近的邻居（1条边），使删除更平滑
+                sorted_idx = np.argsort(dists)
+                nearest_idx = sorted_idx[0]
                 j = indices[nearest_idx]
                 edges[i][j] = 0
                 edges[j][i] = 0
@@ -226,11 +234,16 @@ def _simplified_soinn_on_clusters(
                 edges[s1][s2] = 0
                 edges[s2][s1] = 0
             
-            # 5) 边老化
+            # 5) 边老化（只对 s1 的边进行老化，不要双向更新，避免边被快速删除）
             neighbors_of_s1 = list(edges[s1].keys())
             for nbr in neighbors_of_s1:
+                # 只对从 s1 出发的边进行老化
                 edges[s1][nbr] += 1
-                edges[nbr][s1] += 1
+                # 同步更新 nbr 中指向 s1 的边的年龄（保持一致性）
+                if s1 in edges[nbr]:
+                    edges[nbr][s1] = edges[s1][nbr]  # 同步年龄，而不是 +1
+                
+                # 若某条边年龄 > ad，删除该边（双向删除）
                 if edges[s1][nbr] > ad:
                     del edges[s1][nbr]
                     if s1 in edges[nbr]:
@@ -245,40 +258,60 @@ def _simplified_soinn_on_clusters(
                 nodes[nbr] = _spherical_interpolate(nodes[nbr], x_norm, eta2)
             
             win_counts[s1] += 1
+        
+        # 7) 在每个迭代轮次结束后，删除孤立节点（度 <= max_degree_for_removal 的节点）
+        # 这样可以在每轮迭代结束后清理一次，避免在迭代过程中频繁删除导致不稳定
+        if len(nodes) > 2:  # 只有节点数大于2时才考虑删除
+            to_remove = []
+            for i in range(len(nodes)):
+                # 删除度 <= max_degree_for_removal 的节点（孤立节点或尾部节点）
+                if len(edges[i]) <= max_degree_for_removal:
+                    to_remove.append(i)
             
-            # 7) 定期删除孤立节点
-            if (t % lam) == 0:
-                to_remove = []
-                for i in range(len(nodes)):
-                    if len(edges[i]) <= 1:
-                        to_remove.append(i)
+            # 保留至少 2 个节点
+            if len(to_remove) > 0 and len(nodes) - len(to_remove) >= 2:
+                # 重建节点和边
+                keep_mask = [i not in to_remove for i in range(len(nodes))]
+                old_to_new = {}
+                new_nodes = []
+                new_win_counts = []
+                for old_idx, keep in enumerate(keep_mask):
+                    if keep:
+                        old_to_new[old_idx] = len(new_nodes)
+                        new_nodes.append(nodes[old_idx])
+                        new_win_counts.append(win_counts[old_idx])
                 
-                # 保留至少 2 个节点
-                if len(to_remove) > 0 and len(nodes) - len(to_remove) >= 2:
-                    # 重建节点和边
-                    keep_mask = [i not in to_remove for i in range(len(nodes))]
-                    old_to_new = {}
-                    new_nodes = []
-                    new_win_counts = []
-                    for old_idx, keep in enumerate(keep_mask):
-                        if keep:
-                            old_to_new[old_idx] = len(new_nodes)
-                            new_nodes.append(nodes[old_idx])
-                            new_win_counts.append(win_counts[old_idx])
-                    
-                    new_edges = defaultdict(dict)
-                    for old_i, nbrs in edges.items():
-                        if old_i not in old_to_new:
-                            continue
-                        new_i = old_to_new[old_i]
-                        for old_j in nbrs.keys():
-                            if old_j in old_to_new:
-                                new_j = old_to_new[old_j]
-                                new_edges[new_i][new_j] = edges[old_i][old_j]
-                    
-                    nodes = new_nodes
-                    win_counts = new_win_counts
-                    edges = new_edges
+                new_edges = defaultdict(dict)
+                for old_i, nbrs in edges.items():
+                    if old_i not in old_to_new:
+                        continue
+                    new_i = old_to_new[old_i]
+                    for old_j in nbrs.keys():
+                        if old_j in old_to_new:
+                            new_j = old_to_new[old_j]
+                            new_edges[new_i][new_j] = edges[old_i][old_j]
+                
+                nodes = new_nodes
+                win_counts = new_win_counts
+                edges = new_edges
+                
+                # 删除节点后，检查是否有节点因为邻居被删除而变成孤立节点（度=0）
+                # 为这些节点重新建立连接，确保图的连通性
+                if len(nodes) >= 2:
+                    for i in range(len(nodes)):
+                        if len(edges[i]) == 0:  # 度=0的节点（因为所有邻居都被删除了）
+                            # 为这个节点找到最近的邻居并建立连接
+                            dists = []
+                            indices_new = []
+                            for j in range(len(nodes)):
+                                if j != i:
+                                    dists.append(_cosine_distance(nodes[i], nodes[j]))
+                                    indices_new.append(j)
+                            if len(dists) > 0:
+                                nearest_idx = np.argmin(dists)
+                                j = indices_new[nearest_idx]
+                                edges[i][j] = 0
+                                edges[j][i] = 0
     
     # 最终清理孤立节点
     to_remove = []
@@ -291,28 +324,68 @@ def _simplified_soinn_on_clusters(
         nodes = [nodes[i] for i in range(len(nodes)) if keep_mask[i]]
         win_counts = [win_counts[i] for i in range(len(win_counts)) if keep_mask[i]]
     
+    # 转换边信息：将节点索引映射到最终的边集合
+    # 由于可能删除了孤立节点，需要保留最终的边关系
+    final_edges = {}
+    for i in range(len(nodes)):
+        final_edges[i] = set()
+        # edges 字典中可能包含已删除节点的引用，所以只保留最终存在的节点索引
+        # 由于我们在删除时重建了索引，edges 应该与最终节点对应
+    
+    # 重建边的索引映射：由于可能删除了节点，需要映射旧索引到新索引
+    # 为了简化，我们直接使用最终的 edges 字典（删除后重建的）
+    # 但要注意，最终的 edges 已经是基于最终节点列表的索引
+    
+    # 由于在删除节点时我们已经重建了 old_to_new 映射，edges 已经更新为新索引
+    # 所以直接使用 edges 即可，但需要过滤掉不存在的节点
+    final_edges = {}
+    for i in range(len(nodes)):
+        final_edges[i] = set()
+        if i in edges:
+            for j in edges[i]:
+                if j < len(nodes):  # 确保 j 是有效索引
+                    final_edges[i].add(j)
+    
     # 转换为 _Cluster 对象
     result = []
     for node, count in zip(nodes, win_counts):
         result.append(_Cluster(node, count))
     
-    return result
+    return result, final_edges
 
 
 def _compress_class_worker(args):
     """
     Worker function for parallel compression
     args: (cls, feats, target_k, tau_merge, linkage_method, distance_metric, max_prototypes, 
-           use_soinn_refinement, soinn_ad, soinn_lam, soinn_threshold_scale, soinn_max_iter)
+           use_soinn_refinement, soinn_ad, soinn_lam, soinn_threshold_scale, soinn_max_iter,
+           soinn_max_degree_for_removal)
+    
+    Returns:
+        (cls, clusters, hierarchical_count, final_count, soinn_edges)
+        - cls: 类别编号
+        - clusters: 最终的聚类结果
+        - hierarchical_count: 层次聚类后的聚类点数量
+        - final_count: SOINN 精炼后的最终聚类点数量
+        - soinn_edges: Dict[int, Set[int]] 节点索引到邻居集合的映射（仅在 use_soinn_refinement=True 时有效）
     """
+    # 在多进程环境中，强制使用非 GUI 后端，避免 tkinter 相关错误
+    try:
+        import matplotlib
+        matplotlib.use('Agg', force=True)  # Agg 是纯后端，不需要 GUI
+    except ImportError:
+        pass  # 如果没有安装 matplotlib，跳过
+    
     (cls, feats, target_k, tau_merge, linkage_method, distance_metric, max_prototypes,
-     use_soinn_refinement, soinn_ad, soinn_lam, soinn_threshold_scale, soinn_max_iter) = args
+     use_soinn_refinement, soinn_ad, soinn_lam, soinn_threshold_scale, soinn_max_iter,
+     soinn_max_degree_for_removal) = args
     
     # 归一化
     feats = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
     
     # 1. 层次聚类得到初始簇中心
     clusters = _hierarchical_cluster(feats, target_k, linkage_method, distance_metric)
+    hierarchical_count = len(clusters)  # 记录层次聚类后的数量
     
     # 2. 在簇中心上应用 SOINN 自组织机制（如果启用）
     if use_soinn_refinement and len(clusters) > 1:
@@ -320,24 +393,53 @@ def _compress_class_worker(args):
         cluster_counts = [c.count for c in clusters]
         
         # 应用简化版 SOINN 自组织
-        clusters = _simplified_soinn_on_clusters(
+        clusters, soinn_edges = _simplified_soinn_on_clusters(
             cluster_centers,
             cluster_counts,
             ad=soinn_ad,
             lam=soinn_lam,
             threshold_scale=soinn_threshold_scale,
             max_iterations=soinn_max_iter,
+            max_degree_for_removal=soinn_max_degree_for_removal,
         )
     else:
         # 否则使用简单的距离阈值合并
         clusters = _merge_close_clusters(clusters, tau_merge)
+        soinn_edges = {}  # 没有 SOINN 精炼时没有边信息
     
     # 按样本计数排序，保持确定性
-    clusters = sorted(clusters, key=lambda c: c.count, reverse=True)
+    # 注意：排序会改变节点顺序，需要更新边的索引映射
+    if soinn_edges:
+        # 创建排序前的索引到排序后的索引的映射
+        sorted_indices = sorted(range(len(clusters)), key=lambda i: clusters[i].count, reverse=True)
+        old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_indices)}
+        
+        # 重新排序 clusters
+        clusters = [clusters[i] for i in sorted_indices]
+        
+        # 更新边的索引映射
+        new_edges = {}
+        for old_i, neighbors in soinn_edges.items():
+            if old_i in old_to_new:
+                new_i = old_to_new[old_i]
+                new_edges[new_i] = {old_to_new[j] for j in neighbors if j in old_to_new}
+        soinn_edges = new_edges
+    else:
+        clusters = sorted(clusters, key=lambda c: c.count, reverse=True)
+    
     if max_prototypes is not None:
         clusters = clusters[: max_prototypes]
+        # 更新边索引：如果截断了 clusters，需要更新 soinn_edges
+        if soinn_edges and len(clusters) < len(soinn_edges):
+            new_edges = {}
+            for i in range(len(clusters)):
+                if i in soinn_edges:
+                    new_edges[i] = {j for j in soinn_edges[i] if j < len(clusters)}
+            soinn_edges = new_edges
+    
+    final_count = len(clusters)  # 记录最终数量
         
-    return cls, clusters
+    return cls, clusters, hierarchical_count, final_count, soinn_edges
 
 
 class HCSOINNClassifier:
@@ -358,6 +460,7 @@ class HCSOINNClassifier:
         soinn_lam: int = 20,
         soinn_threshold_scale: float = 0.5,
         soinn_max_iter: int = 3,
+        soinn_max_degree_for_removal: int = 1,
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -374,6 +477,7 @@ class HCSOINNClassifier:
         self.soinn_lam = int(soinn_lam)
         self.soinn_threshold_scale = float(soinn_threshold_scale)
         self.soinn_max_iter = int(soinn_max_iter)
+        self.soinn_max_degree_for_removal = int(soinn_max_degree_for_removal)
 
         # 类中心（NCM）与样本计数
         self.class_mu: Dict[int, np.ndarray] = {}
@@ -442,7 +546,7 @@ class HCSOINNClassifier:
                 cls, feats, target_k, self.tau_merge, 
                 self.linkage_method, self.distance_metric, self.max_prototypes_per_class,
                 self.use_soinn_refinement, self.soinn_ad, self.soinn_lam,
-                self.soinn_threshold_scale, self.soinn_max_iter
+                self.soinn_threshold_scale, self.soinn_max_iter, self.soinn_max_degree_for_removal
             ))
 
         # 并行处理
@@ -453,10 +557,24 @@ class HCSOINNClassifier:
             with ProcessPoolExecutor() as executor:
                 results = list(executor.map(_compress_class_worker, tasks))
             
-            for cls, clusters in results:
+            for cls, clusters, hierarchical_count, final_count, soinn_edges in results:
                 self.class_clusters[cls] = clusters
+                if not hasattr(self, 'class_edges'):
+                    self.class_edges: Dict[int, Dict[int, Set[int]]] = {}
+                self.class_edges[cls] = soinn_edges  # 存储边信息
                 self.buffers[cls] = []  # 清空缓冲
-                logging.info(f"[HC-SOINN] class {cls}: prototypes={len(clusters)}")
+                
+                # 记录层次聚类后的数量和最终数量，方便对比
+                if self.use_soinn_refinement:
+                    logging.info(
+                        f"[HC-SOINN] class {cls}: hierarchical_clusters={hierarchical_count} -> "
+                        f"soinn_refined={final_count} (reduction: {hierarchical_count - final_count})"
+                    )
+                else:
+                    logging.info(
+                        f"[HC-SOINN] class {cls}: hierarchical_clusters={hierarchical_count} -> "
+                        f"merged={final_count} (reduction: {hierarchical_count - final_count})"
+                    )
         else:
             logging.info("[HC-SOINN] No buffer to compress.")
 
@@ -631,19 +749,20 @@ class HCSOINNClassifier:
         return centers, counts
 
     def apply_rigid_transform(
-        self, cls: int, R: Optional[np.ndarray], mu_old: np.ndarray, mu_new: np.ndarray, proxy_scale: float = 1.0
+        self, cls: int, R: Optional[np.ndarray], mu_old: np.ndarray, mu_new: np.ndarray, scale: float = 1.0, base_scale: float = 1.0
     ) -> None:
         """
-        对指定类别的所有原型应用刚性变换：
-        1. 恢复尺度: W_raw = W_norm * proxy_scale
-        2. 变换: W_new_raw = (W_raw - mu_old) @ R + mu_new
+        对指定类别的所有原型应用相似变换 (Similarity Transformation)：
+        1. 恢复尺度: W_raw = W_norm * base_scale (使用旧特征的平均模长作为基准)
+        2. 相似变换: W_new_raw = s * (W_raw - mu_old) @ R + mu_new
            (如果 R is None，则只做平移对齐: W_raw - mean(W_raw) + mu_new)
         3. 归一化: W_new = normalize(W_new_raw)
         
-        R: [D, D] 旋转矩阵 (可选)
+        R: [D, D] 旋转矩阵 (可选，从 Procrustes 计算)
         mu_old: [D] 旧中心 (锚点中心)
         mu_new: [D] 新中心 (锚点中心)
-        proxy_scale: float 旧特征的平均模长
+        scale: float 最优缩放因子 (从 Procrustes 计算，默认 1.0)
+        base_scale: float 基准尺度 (旧特征的平均模长，用于恢复归一化节点，默认 1.0)
         """
         if cls not in self.class_clusters:
             return
@@ -655,20 +774,19 @@ class HCSOINNClassifier:
         # 批量处理 [M, D]
         centers = np.stack([c.center for c in clusters], axis=0)
         
-        # 1. 恢复尺度
-        centers_restored = centers * proxy_scale
+        # 1. 恢复尺度 (将归一化的 centers 恢复到原始特征空间的尺度)
+        centers_restored = centers * base_scale
         
         # 2. 变换逻辑
         if R is not None:
-            # 有旋转矩阵：(W - mu_old) @ R + mu_new
-            # 存在过拟合风险，如果 Anchors 太少
+            # Similarity Transformation: s * (W - mu_old) @ R + mu_new
             centers_centered = centers_restored - mu_old
             centers_rotated = np.dot(centers_centered, R)
-            centers_new_raw = centers_rotated + mu_new
+            centers_scaled = centers_rotated * scale
+            centers_new_raw = centers_scaled + mu_new
         else:
-            # 无旋转矩阵：仅平移对齐 (Translation Only)
+            # 无旋转矩阵：仅平移对齐 (Translation Only, fallback)
             # 强制将 Cluster 中心对齐到 mu_new
-            # 这种方式最稳健，避免了 R 的估计误差，也避免了 mu_old 与 centers 的不匹配
             centers_self_mean = centers_restored.mean(axis=0)
             centers_centered = centers_restored - centers_self_mean
             centers_new_raw = centers_centered + mu_new
@@ -679,17 +797,13 @@ class HCSOINNClassifier:
             
         # 同时更新 NCM 的类中心
         if cls in self.class_mu:
-            # NCM 只有一个点，直接平移到 mu_new 即可
-            # 即使有 R，因为 old_mu ~ mu_old，旋转后也差不多
-            # 为了一致性，直接设为 mu_new (归一化)
-            # 但为了保留 NCM 可能存在的微小偏差信息（如果有的话），还是走一遍流程
             if R is not None:
+                # Similarity Transformation for NCM
                 old_mu = self.class_mu[cls]
-                old_mu_restored = old_mu * proxy_scale
-                new_mu_global = np.dot(old_mu_restored - mu_old, R) + mu_new
+                old_mu_restored = old_mu * base_scale
+                new_mu_global = scale * np.dot(old_mu_restored - mu_old, R) + mu_new
             else:
                 # 仅平移：直接用 mu_new
-                # 因为 NCM 的 old_mu 理论上就应该跟着 mu_new 走
                 new_mu_global = mu_new
                 
             self.class_mu[cls] = _normalize(new_mu_global)

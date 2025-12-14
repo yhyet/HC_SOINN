@@ -1,5 +1,5 @@
 {
-    "prefix": "hcsoinn_star",
+    "prefix": "",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -34,12 +34,17 @@
     "hcsoinn_tau_reject": 2.0,
     "hcsoinn_linkage": "average",
     "hcsoinn_distance": "cosine",
+    "hcsoinn_use_soinn_refinement": true,
+    "hcsoinn_soinn_ad": 20,
+    "hcsoinn_soinn_lam": 20,
+    "hcsoinn_soinn_threshold_scale": 0.5,
+    "hcsoinn_soinn_max_iter": 3,
 
     "save_checkpoint": true,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_hc_soinn_cub",
     "load_all_checkpoints": false,
 
-    "use_feature_alignment": true,
+    "use_feature_alignment": false,
     "alignment_k": 15
 }

@@ -68,6 +68,7 @@ class Learner(BaseLearner):
                 soinn_lam=args.get("hcsoinn_soinn_lam", 20),
                 soinn_threshold_scale=args.get("hcsoinn_soinn_threshold_scale", 0.5),
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
+                soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
         elif self.use_soinn:
             # 处理 seed 参数：如果传入的是列表，取第一个元素
@@ -173,8 +174,8 @@ class Learner(BaseLearner):
                 if isinstance(feats_new, torch.Tensor):
                     feats_new = feats_new.cpu().numpy()
             
-            # 3. Procrustes Analysis 求解变换矩阵
-            # 目标：找到旋转 R 和平移 t，使得 F_new ~ (F_old - mu_old) @ R + mu_new
+            # 3. Similarity Transformation (Procrustes Analysis with Scale)
+            # 目标：找到旋转 R、缩放 s 和平移 t，使得 F_new ~ s * (F_old - mu_old) @ R + mu_new
             
             mu_old = feats_old.mean(axis=0)
             mu_new = feats_new.mean(axis=0)
@@ -182,24 +183,47 @@ class Learner(BaseLearner):
             X_old = feats_old - mu_old
             X_new = feats_new - mu_new
             
+            # 计算旋转矩阵 R (Procrustes)
             # SVD: M = A^T @ B
             # A=X_old, B=X_new
             M = np.dot(X_old.T, X_new)
-            U, _, Vt = np.linalg.svd(M)
+            U, S, Vt = np.linalg.svd(M, full_matrices=False)
             
-            # R = U @ Vt (这里 R 是正交矩阵)
-            # R = np.dot(U, Vt)
+            # R = U @ Vt (正交旋转矩阵)
+            R = np.dot(U, Vt)
             
-            # 计算旧特征的平均模长作为 proxy_scale
-            # feats_old 是原始特征（未归一化）
+            # 计算最优缩放因子 s (Similarity Transformation)
+            # s = trace(X_new^T @ X_old @ R) / trace(X_old^T @ X_old)
+            # 或者更稳定的形式：s = sum(S) / trace(X_old^T @ X_old)
+            # 其中 S 是 SVD 的奇异值
+            trace_old = np.trace(np.dot(X_old.T, X_old))
+            if trace_old > 1e-10:
+                # 使用 SVD 的奇异值之和（更稳定）
+                s = float(np.sum(S) / trace_old)
+            else:
+                # Fallback: 使用 Frobenius 范数比
+                norm_old = np.linalg.norm(X_old, ord='fro')
+                norm_new = np.linalg.norm(X_new, ord='fro')
+                if norm_old > 1e-10:
+                    s = float(norm_new / norm_old)
+                else:
+                    s = 1.0
+            
+            # 确保缩放因子在合理范围内
+            if s < 0.1 or s > 10.0:
+                logging.warning(f"[Feature Alignment] Class {cls}: computed scale s={s:.4f} out of range, clamping to [0.1, 10.0]")
+                s = np.clip(s, 0.1, 10.0)
+            
+            # 计算基准尺度 (用于恢复归一化节点的物理尺度)
+            # 使用旧特征的平均模长作为基准
             norms_old = np.linalg.norm(feats_old, axis=1)
-            proxy_scale = float(np.mean(norms_old))
-            if proxy_scale < 1e-6:
-                proxy_scale = 1.0
+            base_scale = float(np.mean(norms_old))
+            if base_scale < 1e-6:
+                base_scale = 1.0
             
-            # 4. 应用变换到 HC-SOINN 节点
-            # 传入 R=None (仅做平移对齐，避免旋转估计误差)
-            self.hc_soinn.apply_rigid_transform(cls, None, mu_old, mu_new, proxy_scale)
+            # 4. 应用相似变换到 HC-SOINN 节点
+            # 传入 R, s 和 base_scale (Similarity Transformation)
+            self.hc_soinn.apply_rigid_transform(cls, R, mu_old, mu_new, scale=s, base_scale=base_scale)
             
             # 5. 更新缓存的特征 (作为下一轮的 F_old)
             self._class_anchors[cls]["feats"] = feats_new
