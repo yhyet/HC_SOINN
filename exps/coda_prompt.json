@@ -25,5 +25,7 @@
     "drop": 0.0,
     "drop_path": 0.0,
 
-    "prompt_param": [100, 8.0, 0.0]
+    "prompt_param": [100, 8.0, 0.0],
+    
+    "test_only_first_task_classes": false
 }

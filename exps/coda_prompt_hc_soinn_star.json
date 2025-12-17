@@ -1,18 +1,18 @@
 {
     "prefix": "full_task_rehearsal",
-    "dataset": "imagenetr",
+    "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": false,
-    "init_cls": 20,
-    "increment": 20,
+    "init_cls": 10,
+    "increment": 10,
     "model_name": "coda_prompt",
     "backbone_type": "vit_base_patch16_224_coda_prompt",
     "device": ["0"],
     "seed": [0],
-
-    "tuned_epoch": 50,
+    
+    "tuned_epoch": 20,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,
@@ -24,6 +24,7 @@
     "pretrained": true,
     "drop": 0.0,
     "drop_path": 0.0,
+
     "prompt_param": [100, 8.0, 0.0],
 
     "use_hc_soinn": true,
@@ -41,13 +42,13 @@
 
     "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
-    "checkpoint_name": "coda_prompt_hc_soinn_inr",
+    "checkpoint_name": "coda_prompt_hc_soinn_cifar",
     "load_all_checkpoints": false,
+
 
     "use_feature_alignment": true,
     "alignment_k": 15,
     "use_full_task_rehearsal": true,
     "test_only_first_task_classes": false
 }
-
 

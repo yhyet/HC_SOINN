@@ -1,5 +1,5 @@
 {
-    "prefix": "5epoch_star",
+    "prefix": "class1-10",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -12,7 +12,7 @@
     "device": ["0"],
     "seed": [0],
     
-    "tuned_epoch": 5,
+    "tuned_epoch": 20,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,
@@ -28,7 +28,7 @@
     "prompt_param": [100, 8.0, 0.0],
 
     "use_hc_soinn": true,
-    "hcsoinn_max_proto_per_class": 20,
+    "hcsoinn_max_proto_per_class": 60,
     "hcsoinn_alpha": 0.5,
     "hcsoinn_tau_merge": 0.2,
     "hcsoinn_tau_reject": 2.0,
@@ -37,16 +37,18 @@
     "hcsoinn_use_soinn_refinement": true,
     "hcsoinn_soinn_ad": 20,
     "hcsoinn_soinn_lam": 20,
-    "hcsoinn_soinn_threshold_scale": 0.5,
-    "hcsoinn_soinn_max_iter": 3,
+    "hcsoinn_soinn_threshold_scale": 0.8,
+    "hcsoinn_soinn_max_iter": 1,
 
-    "save_checkpoint": true,
+    "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_hc_soinn_cifar",
     "load_all_checkpoints": false,
 
 
-    "use_feature_alignment": true,
-    "alignment_k": 15
+    "use_feature_alignment": false,
+    "alignment_k": 15,
+    "use_full_task_rehearsal": false,
+    "test_only_first_task_classes": true
 }
 

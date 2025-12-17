@@ -730,21 +730,44 @@ class HCSOINNClassifier:
     # ------------------------------------------------------------------ #
     def get_class_prototypes_info(self, cls: int, k: int = 5) -> Tuple[np.ndarray, List[int]]:
         """
-        获取指定类别中重要性最高的 Top-K 原型中心及其权重（样本计数）
-        返回: (centers, counts)
-            centers: [K, D]
-            counts: [K]
+        ========================================================================
+        STAR 辅助函数：获取指定类别的 Top-K 原型节点信息
+        ========================================================================
+        
+        【功能】
+        返回指定类别中重要性最高的 Top-K 个 SOINN 节点中心，用于锚点选择。
+        
+        【重要性定义】
+        - 使用节点的 count 属性（样本计数）作为重要性指标
+        - count 越大，说明该节点代表的数据越多，是更重要的"骨架点"
+        
+        【用途】
+        在锚点选择时，我们选择 Top-K 节点对应的最近邻样本作为锚点。
+        这样可以保证锚点位于数据流形的"关节"位置，而不是边缘或低密度区域。
+        
+        【参数】
+        - cls: 类别 ID
+        - k: 返回的 Top-K 节点数量（默认 5）
+        
+        【返回】
+        - centers: [K, D] Top-K 节点中心（已归一化的单位向量）
+        - counts: [K] 每个节点的重要性（样本计数）
+        
+        【示例】
+        假设某类有 20 个节点，count 分别为 [100, 95, 80, 60, 50, ...]
+        返回 Top-5: centers=[前5个节点中心], counts=[100, 95, 80, 60, 50]
         """
         if cls not in self.class_clusters or len(self.class_clusters[cls]) == 0:
             return np.zeros((0, 0)), []
             
         clusters = self.class_clusters[cls]
-        # 按 count 降序排列
+        # 按 count 降序排列（重要性从高到低）
         sorted_clusters = sorted(clusters, key=lambda c: c.count, reverse=True)
-        top_clusters = sorted_clusters[:k]
+        top_clusters = sorted_clusters[:k]  # 取前 k 个
         
-        centers = np.stack([c.center for c in top_clusters], axis=0)
-        counts = [c.count for c in top_clusters]
+        # 提取节点中心和计数
+        centers = np.stack([c.center for c in top_clusters], axis=0)  # [K, D]
+        counts = [c.count for c in top_clusters]  # [K]
         
         return centers, counts
 
@@ -752,17 +775,63 @@ class HCSOINNClassifier:
         self, cls: int, R: Optional[np.ndarray], mu_old: np.ndarray, mu_new: np.ndarray, scale: float = 1.0, base_scale: float = 1.0
     ) -> None:
         """
-        对指定类别的所有原型应用相似变换 (Similarity Transformation)：
-        1. 恢复尺度: W_raw = W_norm * base_scale (使用旧特征的平均模长作为基准)
-        2. 相似变换: W_new_raw = s * (W_raw - mu_old) @ R + mu_new
-           (如果 R is None，则只做平移对齐: W_raw - mean(W_raw) + mu_new)
-        3. 归一化: W_new = normalize(W_new_raw)
+        ========================================================================
+        STAR 核心函数：应用相似变换到 SOINN 节点 (Apply Similarity Transformation)
+        ========================================================================
         
-        R: [D, D] 旋转矩阵 (可选，从 Procrustes 计算)
-        mu_old: [D] 旧中心 (锚点中心)
-        mu_new: [D] 新中心 (锚点中心)
-        scale: float 最优缩放因子 (从 Procrustes 计算，默认 1.0)
-        base_scale: float 基准尺度 (旧特征的平均模长，用于恢复归一化节点，默认 1.0)
+        【功能】
+        将指定类别的所有 SOINN 节点从旧特征空间变换到新特征空间。
+        使用相似变换 (Similarity Transformation)：y = s · R · x + t
+        
+        【数学公式】
+        完整变换：W_new = normalize(s · (W_old · base_scale - μ_old) @ R + μ_new)
+        
+        其中：
+            - W_old: [M, D] 旧 SOINN 节点（归一化的单位向量）
+            - base_scale: 基准尺度，用于恢复归一化节点的物理尺度
+            - μ_old: [D] 旧锚点的中心
+            - R: [D, D] 旋转矩阵（正交矩阵）
+            - s: 缩放因子（处理 Prompt 导致的幅值变化）
+            - μ_new: [D] 新锚点的中心
+            - W_new: [M, D] 新 SOINN 节点（归一化的单位向量）
+        
+        【变换步骤详解】
+        Step 1: 恢复尺度 (Scale Restoration)
+            W_raw = W_old · base_scale
+            - 目的：将归一化的节点恢复到原始特征空间的物理尺度
+            - base_scale 是旧特征的平均模长
+        
+        Step 2: 去中心化 (Centering)
+            W_centered = W_raw - μ_old
+            - 目的：将节点相对于旧锚点中心进行对齐
+        
+        Step 3: 旋转 (Rotation)
+            W_rotated = W_centered @ R
+            - 目的：应用 Procrustes 计算出的旋转矩阵
+        
+        Step 4: 缩放 (Scaling)
+            W_scaled = s · W_rotated
+            - 目的：处理特征空间的尺度变化（如 Prompt 导致的幅值变化）
+        
+        Step 5: 平移 (Translation)
+            W_new_raw = W_scaled + μ_new
+            - 目的：将节点平移到新锚点的中心
+        
+        Step 6: 归一化 (Normalization)
+            W_new = normalize(W_new_raw)
+            - 目的：将节点投影回单位超球面（HC-SOINN 要求）
+        
+        【参数】
+        - cls: 类别 ID
+        - R: [D, D] 旋转矩阵（从 Procrustes 计算，None 表示只做平移）
+        - mu_old: [D] 旧锚点的中心
+        - mu_new: [D] 新锚点的中心
+        - scale: 最优缩放因子（从 Procrustes 计算，默认 1.0）
+        - base_scale: 基准尺度（旧特征的平均模长，默认 1.0）
+        
+        【输出】
+        - 更新 self.class_clusters[cls] 中所有节点的 center 属性
+        - 更新 self.class_mu[cls] (NCM 类中心)
         """
         if cls not in self.class_clusters:
             return
@@ -771,41 +840,57 @@ class HCSOINNClassifier:
         if len(clusters) == 0:
             return
         
-        # 批量处理 [M, D]
+        # ========== Step 1: 批量提取节点中心 ==========
+        # centers: [M, D] 该类所有 SOINN 节点中心（已归一化的单位向量）
         centers = np.stack([c.center for c in clusters], axis=0)
         
-        # 1. 恢复尺度 (将归一化的 centers 恢复到原始特征空间的尺度)
-        centers_restored = centers * base_scale
+        # ========== Step 2: 恢复尺度 ==========
+        # 将归一化的节点恢复到原始特征空间的物理尺度
+        # 原因：SOINN 节点是归一化的（模长=1），但特征漂移发生在原始欧氏空间
+        # base_scale 是旧特征的平均模长，用于恢复尺度
+        centers_restored = centers * base_scale  # [M, D]
         
-        # 2. 变换逻辑
+        # ========== Step 3: 应用相似变换 ==========
         if R is not None:
-            # Similarity Transformation: s * (W - mu_old) @ R + mu_new
-            centers_centered = centers_restored - mu_old
-            centers_rotated = np.dot(centers_centered, R)
-            centers_scaled = centers_rotated * scale
-            centers_new_raw = centers_scaled + mu_new
-        else:
-            # 无旋转矩阵：仅平移对齐 (Translation Only, fallback)
-            # 强制将 Cluster 中心对齐到 mu_new
-            centers_self_mean = centers_restored.mean(axis=0)
-            centers_centered = centers_restored - centers_self_mean
-            centers_new_raw = centers_centered + mu_new
-        
-        # 3. 归一化并更新回对象
-        for i, c in enumerate(clusters):
-            c.center = _normalize(centers_new_raw[i])
+            # ===== 完整相似变换：s · (W - μ_old) @ R + μ_new =====
             
-        # 同时更新 NCM 的类中心
+            # 3.1 去中心化：相对于旧锚点中心
+            centers_centered = centers_restored - mu_old  # [M, D]
+            
+            # 3.2 旋转：应用 Procrustes 计算出的旋转矩阵
+            centers_rotated = np.dot(centers_centered, R)  # [M, D]
+            
+            # 3.3 缩放：处理特征空间的尺度变化
+            centers_scaled = centers_rotated * scale  # [M, D]
+            
+            # 3.4 平移：移动到新锚点的中心
+            centers_new_raw = centers_scaled + mu_new  # [M, D]
+        else:
+            # ===== Fallback: 仅平移对齐（当 R 为 None 时）=====
+            # 这种情况通常不会发生（因为 STAR 总是计算 R），但保留作为安全机制
+            # 策略：只保留拓扑结构（相对位置），强制对齐到新中心
+            centers_self_mean = centers_restored.mean(axis=0)  # [D] 节点自身的中心
+            centers_centered = centers_restored - centers_self_mean  # 去中心化
+            centers_new_raw = centers_centered + mu_new  # 平移到新中心
+        
+        # ========== Step 4: 归一化并更新节点 ==========
+        # 将变换后的节点投影回单位超球面（HC-SOINN 要求节点是归一化的）
+        for i, c in enumerate(clusters):
+            c.center = _normalize(centers_new_raw[i])  # 更新节点中心
+            
+        # ========== Step 5: 同时更新 NCM 类中心 ==========
+        # NCM 的类中心也需要应用相同的变换，保持一致性
         if cls in self.class_mu:
             if R is not None:
-                # Similarity Transformation for NCM
-                old_mu = self.class_mu[cls]
-                old_mu_restored = old_mu * base_scale
-                new_mu_global = scale * np.dot(old_mu_restored - mu_old, R) + mu_new
+                # 对 NCM 应用相同的相似变换
+                old_mu = self.class_mu[cls]  # [D] 旧的 NCM 中心（归一化）
+                old_mu_restored = old_mu * base_scale  # 恢复尺度
+                new_mu_global = scale * np.dot(old_mu_restored - mu_old, R) + mu_new  # 相似变换
             else:
-                # 仅平移：直接用 mu_new
+                # Fallback: 仅平移
                 new_mu_global = mu_new
                 
+            # 归一化并更新 NCM 中心
             self.class_mu[cls] = _normalize(new_mu_global)
 
     # ------------------------------------------------------------------ #

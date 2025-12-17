@@ -14,6 +14,7 @@ from utils.toolkit import tensor2numpy
 from utils.knn_classifier import KNNClassifier
 from utils.soinn_classifier import SOINNClassifier
 from utils.hc_soinn_classifier import HCSOINNClassifier
+from utils.star_alignment import STARAlignment
 import os
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
@@ -92,10 +93,39 @@ class Learner(BaseLearner):
         total_trainable_params = sum(p.numel() for p in self._network.fc.parameters() if p.requires_grad) + sum(p.numel() for p in self._network.prompt.parameters() if p.requires_grad)
         logging.info(f'{total_trainable_params:,} fc and prompt training parameters.')
         
-        # HC-SOINN 特征漂移对齐配置
+        # HC-SOINN 特征漂移对齐配置 (STAR)
         self.use_feature_alignment = args.get("use_feature_alignment", False)
-        self.alignment_k = args.get("alignment_k", 5)
-        self._class_anchors = {} # {cls: {'images': tensor, 'feats': numpy}}
+        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
+        self.star = None  # STAR 对齐器（延迟初始化）
+        
+        # 实验模式：只测试第一个任务的类别（用于分析特征漂移 vs 新类别干扰）
+        self.test_only_first_task_classes = args.get("test_only_first_task_classes", False)
+        if self.test_only_first_task_classes:
+            self.init_cls = args.get("init_cls", 10)
+            logging.info(f"实验模式启用：只测试第一个任务的类别 (0-{self.init_cls-1})，用于分析特征漂移影响")
+        
+        # 如果启用特征对齐且使用 HC-SOINN，初始化 STAR
+        if self.use_feature_alignment and self.use_hc_soinn:
+            # 定义特征提取函数（适配 CodaPrompt 的网络结构）
+            def feature_extractor(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module(x, pen=True, train=False)
+                else:
+                    feats = self._network(x, pen=True, train=False)
+                if isinstance(feats, tuple):
+                    feats = feats[0]
+                return feats
+            
+            self.star = STARAlignment(
+                hc_soinn=self.hc_soinn,
+                feature_extractor=feature_extractor,
+                device=self._device,
+                use_full_task_rehearsal=self.use_full_task_rehearsal,
+            )
+            if self.use_full_task_rehearsal:
+                logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
+            else:
+                logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
 
         # NCM分类器：初始化类均值存储
         self._class_means = None
@@ -104,26 +134,71 @@ class Learner(BaseLearner):
 
     def after_task(self):
         """
-        每个 task 结束后的统一处理流程：
-        1. 漂移对齐（Feature Alignment）：对旧类别的 SOINN 节点进行刚性变换校正
-        2. 压缩（Compress）：对当前任务的数据生成 SOINN 节点
-        3. 锚点选择（Anchor Selection）：为当前任务选择锚点用于未来的漂移对齐
-        4. 其他清理工作
+        ========================================================================
+        STAR (Structure-Topology Alignment via Residuals) Pipeline
+        ========================================================================
+        每个 task 结束后的统一处理流程（STAR 特征漂移对齐的核心入口）：
+        
+        【Pipeline 流程说明】
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Task t 训练结束，Backbone 已更新为 f_t                          │
+        └─────────────────────────────────────────────────────────────────┘
+                              ↓
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Step 1: 漂移对齐 (Drift Alignment)                              │
+        │   - 对旧类别 (C_0, ..., C_{t-1}) 的 SOINN 节点进行相似变换校正  │
+        │   - 使用保存的锚点计算 Procrustes 变换 (R, s, t)                │
+        │   - 将旧节点从 f_{t-1} 空间对齐到 f_t 空间                      │
+        └─────────────────────────────────────────────────────────────────┘
+                              ↓
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Step 2: 压缩 (Compress)                                          │
+        │   - 对当前任务 (C_t) 的训练数据生成 SOINN 节点                  │
+        │   - 使用层次聚类压缩，生成有限数量的原型                        │
+        └─────────────────────────────────────────────────────────────────┘
+                              ↓
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Step 3: 锚点选择 (Anchor Selection)                              │
+        │   - 为当前任务 (C_t) 的每个类别选择 Top-K 锚点                  │
+        │   - 基于 SOINN 拓扑骨架（重要性最高的节点）选择最近邻样本        │
+        │   - 保存锚点图片和特征，用于下一轮 (Task t+1) 的漂移对齐        │
+        └─────────────────────────────────────────────────────────────────┘
+        
+        【关键设计】
+        - 顺序很重要：必须先对齐旧类，再压缩新类，最后选锚点
+        - 锚点只保存当前任务的，旧任务的锚点在上一轮已经更新过特征
+        - 对齐操作会同时更新 SOINN 节点和 NCM 类中心
         """
-        # 1. 特征漂移对齐（针对旧类别）
-        if self.use_feature_alignment and self.use_hc_soinn:
-            self._compute_and_apply_drift()
+        # ========== Step 1: 特征漂移对齐（针对旧类别）==========
+        # 目的：将旧类别的 SOINN 节点从旧模型空间对齐到新模型空间
+        # 使用 STAR 模块进行对齐
+        if self.star is not None:
+            self.star.align_old_classes(self._cur_task)
 
-        # 2. 压缩 HC-SOINN（生成当前任务的节点）
+        # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
+        # 目的：为当前任务的新类别生成 SOINN 原型节点
+        # 输入：self.hc_soinn.buffers (当前任务的训练特征)
+        # 输出：更新 self.hc_soinn.class_clusters (新增当前任务的节点)
         if self.use_hc_soinn:
             try:
                 self.hc_soinn.compress()
             except Exception as e:
                 logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
                 
-        # 3. 为当前任务选择锚点（用于下一轮对齐）
-        if self.use_feature_alignment and self.use_hc_soinn:
-            self._select_and_store_anchors()
+        # ========== Step 3: 为当前任务选择锚点（用于下一轮对齐）==========
+        # 目的：为当前任务的每个类别选择 Top-K 锚点，保存用于下一轮漂移对齐
+        # 使用 STAR 模块进行锚点选择
+        if self.star is not None:
+            # 获取当前任务的训练数据集
+            dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train", mode="test"
+            )
+            self.star.select_anchors_for_current_task(
+                dataset=dataset,
+                batch_size=self.batch_size,
+                num_workers=num_workers
+            )
 
         # 4. 基于使用频率的渐进式剪枝（只剪当前 task 的类别，可通过开关控制）
         if getattr(self, "use_knn", False) and getattr(self, "knn_prune_zero_usage", False):
@@ -150,162 +225,6 @@ class Learner(BaseLearner):
         if getattr(self, "use_soinn", False) and hasattr(self, "soinn"):
             self._visualize_soinn_tsne()
 
-    def _compute_and_apply_drift(self):
-        """
-        计算并应用特征漂移校正（基于 Procrustes Analysis 的刚性变换）
-        """
-        if self._cur_task == 0 or len(self._class_anchors) == 0:
-            return
-
-        logging.info("[Feature Alignment] Starting drift estimation and alignment...")
-        self._network.eval()
-        feature_fn = self._get_soinn_feature_fn()
-
-        aligned_count = 0
-        for cls, data in self._class_anchors.items():
-            # 1. 获取旧特征 (cached F_old, 基于上一轮模型)
-            feats_old = data["feats"] # [K, D]
-            imgs = data["images"]     # [K, C, H, W]
-            
-            # 2. 计算新特征 (F_new, 基于当前模型)
-            with torch.no_grad():
-                imgs = imgs.to(self._device)
-                feats_new = feature_fn(imgs) # [K, D]
-                if isinstance(feats_new, torch.Tensor):
-                    feats_new = feats_new.cpu().numpy()
-            
-            # 3. Similarity Transformation (Procrustes Analysis with Scale)
-            # 目标：找到旋转 R、缩放 s 和平移 t，使得 F_new ~ s * (F_old - mu_old) @ R + mu_new
-            
-            mu_old = feats_old.mean(axis=0)
-            mu_new = feats_new.mean(axis=0)
-            
-            X_old = feats_old - mu_old
-            X_new = feats_new - mu_new
-            
-            # 计算旋转矩阵 R (Procrustes)
-            # SVD: M = A^T @ B
-            # A=X_old, B=X_new
-            M = np.dot(X_old.T, X_new)
-            U, S, Vt = np.linalg.svd(M, full_matrices=False)
-            
-            # R = U @ Vt (正交旋转矩阵)
-            R = np.dot(U, Vt)
-            
-            # 计算最优缩放因子 s (Similarity Transformation)
-            # s = trace(X_new^T @ X_old @ R) / trace(X_old^T @ X_old)
-            # 或者更稳定的形式：s = sum(S) / trace(X_old^T @ X_old)
-            # 其中 S 是 SVD 的奇异值
-            trace_old = np.trace(np.dot(X_old.T, X_old))
-            if trace_old > 1e-10:
-                # 使用 SVD 的奇异值之和（更稳定）
-                s = float(np.sum(S) / trace_old)
-            else:
-                # Fallback: 使用 Frobenius 范数比
-                norm_old = np.linalg.norm(X_old, ord='fro')
-                norm_new = np.linalg.norm(X_new, ord='fro')
-                if norm_old > 1e-10:
-                    s = float(norm_new / norm_old)
-                else:
-                    s = 1.0
-            
-            # 确保缩放因子在合理范围内
-            if s < 0.1 or s > 10.0:
-                logging.warning(f"[Feature Alignment] Class {cls}: computed scale s={s:.4f} out of range, clamping to [0.1, 10.0]")
-                s = np.clip(s, 0.1, 10.0)
-            
-            # 计算基准尺度 (用于恢复归一化节点的物理尺度)
-            # 使用旧特征的平均模长作为基准
-            norms_old = np.linalg.norm(feats_old, axis=1)
-            base_scale = float(np.mean(norms_old))
-            if base_scale < 1e-6:
-                base_scale = 1.0
-            
-            # 4. 应用相似变换到 HC-SOINN 节点
-            # 传入 R, s 和 base_scale (Similarity Transformation)
-            self.hc_soinn.apply_rigid_transform(cls, R, mu_old, mu_new, scale=s, base_scale=base_scale)
-            
-            # 5. 更新缓存的特征 (作为下一轮的 F_old)
-            self._class_anchors[cls]["feats"] = feats_new
-            aligned_count += 1
-            
-        logging.info(f"[Feature Alignment] Aligned {aligned_count} classes.")
-
-    def _select_and_store_anchors(self):
-        """
-        为当前任务的类别选择并存储锚点
-        策略：基于 HC-SOINN 拓扑骨架 (Top-K Nodes) 的最近邻样本
-        """
-        logging.info("[Feature Alignment] Selecting anchors for current task...")
-        self._network.eval()
-        feature_fn = self._get_soinn_feature_fn()
-        
-        # 获取当前任务的所有训练数据（无数据增强）
-        dataset = self.data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes), 
-            source="train", mode="test"
-        )
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
-        
-        # 提取特征用于最近邻搜索
-        all_feats = []
-        all_imgs = []
-        all_targets = []
-        
-        with torch.no_grad():
-            for _, inputs, targets in loader:
-                inputs = inputs.to(self._device)
-                feats = feature_fn(inputs)
-                if isinstance(feats, torch.Tensor):
-                    feats = feats.cpu().numpy()
-                all_feats.append(feats)
-                all_imgs.append(inputs.cpu()) 
-                all_targets.append(targets.cpu().numpy())
-                
-        if len(all_feats) == 0:
-            return
-
-        all_feats = np.concatenate(all_feats, axis=0)
-        all_imgs = torch.cat(all_imgs, dim=0)
-        all_targets = np.concatenate(all_targets, axis=0)
-        
-        # 为每个新类选择锚点
-        current_classes = np.unique(all_targets)
-        for cls in current_classes:
-            # 获取 Top-K 节点中心
-            centers, counts = self.hc_soinn.get_class_prototypes_info(cls, k=self.alignment_k)
-            if len(centers) == 0:
-                continue
-                
-            cls_mask = (all_targets == cls)
-            cls_feats = all_feats[cls_mask]
-            cls_imgs_tensor = all_imgs[cls_mask]
-            
-            if len(cls_feats) == 0:
-                continue
-
-            anchors_imgs = []
-            anchors_feats = []
-            
-            # 归一化样本特征用于余弦相似度计算 (因为节点中心是归一化的)
-            cls_feats_norm = cls_feats / (np.linalg.norm(cls_feats, axis=1, keepdims=True) + 1e-8)
-            
-            for center in centers:
-                # 找最近邻
-                sims = np.dot(cls_feats_norm, center)
-                best_idx = np.argmax(sims)
-                
-                anchors_imgs.append(cls_imgs_tensor[best_idx])
-                anchors_feats.append(cls_feats[best_idx]) # 保存原始特征
-                
-            self._class_anchors[cls] = {
-                "images": torch.stack(anchors_imgs),
-                "feats": np.stack(anchors_feats)
-            }
-            
-        logging.info(f"[Feature Alignment] Anchors stored for classes: {current_classes}")
-
-
     def incremental_train(self, data_manager):
         self._cur_task += 1
         
@@ -325,7 +244,12 @@ class Learner(BaseLearner):
             logging.info("Learning on {}-{} (checkpoint loaded, skipping training)".format(self._known_classes, self._total_classes))
             
             # 准备测试数据
-            test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
+            if self.test_only_first_task_classes:
+                test_classes = np.arange(0, self.init_cls)
+                logging.info(f"实验模式：测试数据集只包含类别 {test_classes}")
+            else:
+                test_classes = np.arange(0, self._total_classes)
+            test_dataset = data_manager.get_dataset(test_classes, source="test", mode="test")
             self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
             
             # 更新prompt的任务计数（如果需要）
@@ -341,7 +265,12 @@ class Learner(BaseLearner):
             train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="train")
             self.train_dataset = train_dataset
             self.data_manager = data_manager
-            test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
+            if self.test_only_first_task_classes:
+                test_classes = np.arange(0, self.init_cls)
+                logging.info(f"实验模式：测试数据集只包含类别 {test_classes}")
+            else:
+                test_classes = np.arange(0, self._total_classes)
+            test_dataset = data_manager.get_dataset(test_classes, source="test", mode="test")
             self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
             
             # 统一构建所有分类器（与正常训练流程一致）
@@ -366,7 +295,12 @@ class Learner(BaseLearner):
         self.train_dataset = train_dataset
         self.data_manager = data_manager
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, drop_last=True, num_workers=num_workers)
-        test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
+        if self.test_only_first_task_classes:
+            test_classes = np.arange(0, self.init_cls)
+            logging.info(f"实验模式：测试数据集只包含类别 {test_classes}")
+        else:
+            test_classes = np.arange(0, self._total_classes)
+        test_dataset = data_manager.get_dataset(test_classes, source="test", mode="test" )
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
 
         if len(self._multiple_gpus) > 1:
@@ -429,15 +363,26 @@ class Learner(BaseLearner):
         - 如果之前有类均值（正常训练）：保留之前任务的类均值，只计算当前任务新类别的类均值
         - 如果没有类均值（首次任务或加载checkpoint后）：计算所有已见过的任务的类均值
         - 这样符合增量学习的累积存储要求
+        - 实验模式：只构建第一个任务的类别（0-init_cls-1）
         """
+        # 实验模式：只构建第一个任务的类别
+        if self.test_only_first_task_classes:
+            ncm_classes = self.init_cls
+            logging.info(f"实验模式：NCM分类器只构建第一个任务的类别 (0-{ncm_classes-1})")
+        else:
+            ncm_classes = self._total_classes
+        
         # 判断是否需要重建所有类均值（首次任务或加载checkpoint后）
         need_rebuild_all = (self._class_means is None) or (self._class_means.shape[0] == 0)
         
         if need_rebuild_all:
             # 首次任务或加载checkpoint后：需要计算所有已见过的任务的类均值
-            logging.info(f"Building NCM classifier: computing all seen classes (0-{self._total_classes-1}) [first task or after checkpoint load]")
+            if self.test_only_first_task_classes:
+                logging.info(f"Building NCM classifier (实验模式): computing first task classes (0-{ncm_classes-1}) [first task or after checkpoint load]")
+            else:
+                logging.info(f"Building NCM classifier: computing all seen classes (0-{ncm_classes-1}) [first task or after checkpoint load]")
             all_train_dataset = self.data_manager.get_dataset(
-                np.arange(0, self._total_classes), source="train", mode="test"
+                np.arange(0, ncm_classes), source="train", mode="test"
             )
             all_train_loader = DataLoader(
                 all_train_dataset, 
@@ -448,7 +393,7 @@ class Learner(BaseLearner):
             )
             
             # 初始化类均值数组
-            self._class_means = np.zeros((self._total_classes, self.feature_dim))
+            self._class_means = np.zeros((ncm_classes, self.feature_dim))
             
             # 提取所有训练样本的特征
             embedding_list = []
@@ -476,12 +421,18 @@ class Learner(BaseLearner):
                     proto = embedding.mean(0)
                     self._class_means[int(class_index), :] = proto.cpu().numpy()
                 
-                logging.info(f"NCM classifier built: computed class means for {len(class_list)} classes (total: {self._total_classes} classes)")
+                logging.info(f"NCM classifier built: computed class means for {len(class_list)} classes (total: {ncm_classes} classes)")
             else:
                 logging.warning("No training data available for NCM classifier")
         else:
             # 正常训练：累积存储机制 - 保留之前的类均值，只计算当前任务新类别的类均值
-            logging.info(f"Building NCM classifier: preserving previous class means, computing new classes ({self._known_classes}-{self._total_classes-1})")
+            if self.test_only_first_task_classes:
+                # 实验模式：不添加新类别，只保留第一个任务的类别
+                logging.info(f"Building NCM classifier (实验模式): preserving first task class means (0-{ncm_classes-1}), skipping new classes")
+                # 不需要更新类均值，直接返回
+                return
+            else:
+                logging.info(f"Building NCM classifier: preserving previous class means, computing new classes ({self._known_classes}-{self._total_classes-1})")
             
             # 扩展类均值数组以容纳新类别，保留之前的类均值
             if self._class_means.shape[0] < self._total_classes:
@@ -533,12 +484,17 @@ class Learner(BaseLearner):
                 logging.warning("No training data available for NCM classifier update")
         
         # 更新所有类别的NCM FC层权重
+        if self.test_only_first_task_classes:
+            ncm_classes = self.init_cls
+        else:
+            ncm_classes = self._total_classes
+        
         if isinstance(self._network, nn.DataParallel):
-            for class_index in range(self._total_classes):
+            for class_index in range(ncm_classes):
                 if np.any(self._class_means[class_index] != 0):  # 只更新有数据的类别
                     self._network.module.ncm_fc.weight.data[int(class_index), :] = torch.from_numpy(self._class_means[int(class_index), :]).float().to(self._device)
         else:
-            for class_index in range(self._total_classes):
+            for class_index in range(ncm_classes):
                 if np.any(self._class_means[class_index] != 0):  # 只更新有数据的类别
                     self._network.ncm_fc.weight.data[int(class_index), :] = torch.from_numpy(self._class_means[int(class_index), :]).float().to(self._device)
     
@@ -929,10 +885,16 @@ class Learner(BaseLearner):
         """使用原始FC层进行评估"""
         self._network.eval()
         y_pred, y_true = [], []
+        # 实验模式：只使用第一个任务的类别
+        if self.test_only_first_task_classes:
+            eval_classes = self.init_cls
+        else:
+            eval_classes = self._total_classes
+        
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
-                outputs = self._network(inputs)[:, :self._total_classes]
+                outputs = self._network(inputs)[:, :eval_classes]
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[1]
@@ -985,6 +947,12 @@ class Learner(BaseLearner):
         """使用NCM FC层进行评估（CosineLinear会自动归一化）"""
         self._network.eval()
         y_pred, y_true = [], []
+        # 实验模式：只使用第一个任务的类别
+        if self.test_only_first_task_classes:
+            ncm_classes = self.init_cls
+        else:
+            ncm_classes = self._total_classes
+        
         with torch.no_grad():
             for _, (_, inputs, targets) in enumerate(loader):
                 inputs = inputs.to(self._device)
@@ -999,8 +967,8 @@ class Learner(BaseLearner):
                     ncm_output = self._network.ncm_fc(features)
                 # 提取logits
                 ncm_logits = ncm_output['logits']
-                # 只保留已学习类别
-                ncm_logits = ncm_logits[:, :self._total_classes]
+                # 只保留已学习类别（实验模式下只保留第一个任务的类别）
+                ncm_logits = ncm_logits[:, :ncm_classes]
                 # Top-k预测
                 predicts = torch.topk(
                     ncm_logits, k=self.topk, dim=1, largest=True, sorted=True
@@ -1106,10 +1074,16 @@ class Learner(BaseLearner):
     def _compute_accuracy(self, model, loader):
         model.eval()
         correct, total = 0, 0
+        # 实验模式：只使用第一个任务的类别
+        if self.test_only_first_task_classes:
+            eval_classes = self.init_cls
+        else:
+            eval_classes = self._total_classes
+        
         for i, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
-                outputs = model(inputs)[:, :self._total_classes]
+                outputs = model(inputs)[:, :eval_classes]
             predicts = torch.max(outputs, dim=1)[1]
             correct += (predicts.cpu() == targets).sum()
             total += len(targets)
