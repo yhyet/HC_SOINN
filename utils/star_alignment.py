@@ -286,9 +286,32 @@ class STARAlignment:
             selected_indices = set()  # 用于去重
             selected_image_indices = []  # 保存去重后的图像索引（用于从 all_imgs 和 all_feats 中取出）
             
+            # 获取特征维度（用于处理 CL-LoRA 等需要维度对齐的情况）
+            feat_dim = cls_feats_norm.shape[1]  # 当前提取的特征维度（例如：768 for general_lora）
+            
             for target_point in target_points:
+                # 处理维度不匹配：如果 target_point 维度大于 feat_dim，说明是完整拼接特征
+                # 对于 CL-LoRA，需要提取 general_lora 对应的段（第一个 adapter，即前 feat_dim 维）
+                if target_point.shape[0] > feat_dim:
+                    # 检查是否是整数倍关系（CL-LoRA 的情况）
+                    if target_point.shape[0] % feat_dim == 0:
+                        # 提取第一个 adapter 段（general_lora）
+                        target_point_aligned = target_point[:feat_dim]
+                    else:
+                        logging.warning(f"[STAR] Dimension mismatch: target_point shape {target_point.shape} vs feat_dim {feat_dim}, skipping")
+                        continue
+                elif target_point.shape[0] < feat_dim:
+                    logging.warning(f"[STAR] Dimension mismatch: target_point shape {target_point.shape} < feat_dim {feat_dim}, skipping")
+                    continue
+                else:
+                    # 维度匹配，直接使用
+                    target_point_aligned = target_point
+                
+                # 归一化目标点（确保归一化）
+                target_point_norm = target_point_aligned / (np.linalg.norm(target_point_aligned) + 1e-8)
+                
                 # 计算余弦相似度
-                sims = np.dot(cls_feats_norm, target_point)  # [N_cls]
+                sims = np.dot(cls_feats_norm, target_point_norm)  # [N_cls]
                 best_idx = np.argmax(sims)  # 在 cls_feats 中的索引
                 
                 # 转换为原始 all_imgs/all_feats 中的索引

@@ -231,12 +231,27 @@ class ClusterStructureAnalyzer:
         U, S, Vt = np.linalg.svd(M, full_matrices=False)
         R = np.dot(U, Vt)  # [D, D] 正交旋转矩阵
         
-        # 计算最优缩放因子 s
-        trace_X1 = np.trace(np.dot(X1_centered.T, X1_centered))
-        if trace_X1 > 1e-10:
-            s = float(np.sum(S) / trace_X1)
+        # 修正：计算最优缩放因子 s
+        # 标准Procrustes分析中，最优缩放因子为：
+        # s = trace(X1^T @ X2 @ R) / trace(X1^T @ X1)
+        # 但需要注意：如果trace为负，说明需要反射（reflection），这里我们只考虑旋转
+        # 更稳健的方法：先计算旋转后的X1，然后计算缩放因子
+        X1_rotated = np.dot(X1_centered, R)  # [N, D]
+        
+        # 计算最优缩放因子：最小化 ||X2 - s * X1_rotated||_F^2
+        # 对s求导并令其为0：s = trace(X1_rotated^T @ X2) / trace(X1_rotated^T @ X1_rotated)
+        trace_X1_rotated_sq = np.trace(np.dot(X1_rotated.T, X1_rotated))
+        if trace_X1_rotated_sq > 1e-10:
+            trace_X1_rotated_X2 = np.trace(np.dot(X1_rotated.T, X2_centered))
+            s = float(trace_X1_rotated_X2 / trace_X1_rotated_sq)
+            # 确保缩放因子非负（如果为负，说明需要反射，但我们只考虑旋转+缩放）
+            if s < 0:
+                # 如果缩放因子为负，使用Frobenius范数比作为fallback
+                norm_X1 = np.linalg.norm(X1_centered, ord='fro')
+                norm_X2 = np.linalg.norm(X2_centered, ord='fro')
+                s = float(norm_X2 / norm_X1) if norm_X1 > 1e-10 else 1.0
         else:
-            # Fallback: 使用 Frobenius 范数比
+            # Fallback: 使用 Frobenius 范数比（当trace接近0时）
             norm_X1 = np.linalg.norm(X1_centered, ord='fro')
             norm_X2 = np.linalg.norm(X2_centered, ord='fro')
             if norm_X1 > 1e-10:
@@ -244,8 +259,8 @@ class ClusterStructureAnalyzer:
             else:
                 s = 1.0
         
-        # 计算变换后的X1
-        X1_transformed = s * np.dot(X1_centered, R)  # [N, D]
+        # 计算变换后的X1（使用已计算的X1_rotated）
+        X1_transformed = s * X1_rotated  # [N, D]
         
         # 计算Procrustes距离（Frobenius范数）
         diff = X2_centered - X1_transformed
@@ -305,6 +320,7 @@ class ClusterStructureAnalyzer:
         """
         self._cluster_samples.clear()
         logging.info("[Cluster Structure Analysis] Samples cleared")
+
 
 
 

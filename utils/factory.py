@@ -56,6 +56,10 @@ def get_model(model_name, args):
         from models.duct import Learner
     elif name == 'tuna':
         from models.tuna import Learner
+    elif name == 'cllora':
+        from models.cllora import Learner
+    elif name == 'sema':
+        from models.sema import Learner
     else:
         assert 0
     return Learner(args)

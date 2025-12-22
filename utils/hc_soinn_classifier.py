@@ -480,7 +480,7 @@ class HCSOINNClassifier:
         self.soinn_max_degree_for_removal = int(soinn_max_degree_for_removal)
 
         # 类中心（NCM）与样本计数
-        self.class_mu: Dict[int, np.ndarray] = {}
+        self.class_mu: Dict[int, np.ndarray] = {}  # 标准模式：存储完整特征的原型
         self.class_count: Dict[int, int] = {}
 
         # 类内子簇
@@ -500,6 +500,7 @@ class HCSOINNClassifier:
         labels = np.asarray(labels, dtype=np.int64)
         if features.shape[0] == 0:
             return
+        
         for cls in np.unique(labels):
             cls_mask = labels == cls
             cls_feats = features[cls_mask]
@@ -511,7 +512,7 @@ class HCSOINNClassifier:
                 self.buffers[cls] = []
             self.buffers[cls].append(cls_feats)
 
-            # 更新 NCM
+            # 更新完整特征的class_mu（标准模式）
             cls_count_old = self.class_count.get(cls, 0)
             cls_sum_old = self.class_mu[cls] * cls_count_old if cls in self.class_mu else 0
             cls_sum_new = cls_sum_old + cls_feats.sum(axis=0)
@@ -595,87 +596,337 @@ class HCSOINNClassifier:
             device = torch.device("cpu")
 
         query_features = np.asarray(query_features, dtype=np.float32)
+        query_dim = query_features.shape[1]
         
-        # 准备 NCM 中心矩阵
+        # 标准模式：使用完整的特征
         classes = sorted(self.class_mu.keys())
         if len(classes) == 0:
             fallback = np.arange(min(topk, max(total_classes, 1)), dtype=np.int64)
             return np.tile(fallback, (query_features.shape[0], 1))
-            
-        # 确保涵盖所有可能的类别索引（0 到 total_classes-1）
-        # 如果 self.class_mu 中缺少某些类别，我们需要处理，但通常不会发生
-        # 为简单起见，我们假设 total_classes 足够大，并使用 self.class_mu 中的类别
         
         # 构建 NCM 中心 Tensor
         ncm_centers = []
         valid_classes = []
         for cls in classes:
-            ncm_centers.append(self.class_mu[cls])
-            valid_classes.append(cls)
+            cls_mu = self.class_mu[cls]
+            # 只使用维度匹配的类别
+            if cls_mu.shape[0] == query_dim:
+                ncm_centers.append(cls_mu)
+                valid_classes.append(cls)
+            else:
+                logging.debug(
+                    f"Skipping class {cls} in NCM prediction: "
+                    f"class_mu dim={cls_mu.shape[0]}, query dim={query_dim}"
+                )
         
         if not ncm_centers:
-             return np.zeros((query_features.shape[0], topk), dtype=np.int64)
+            logging.warning(
+                f"No valid NCM centers found for query dim={query_dim}. "
+                f"Available class_mu dims: {[self.class_mu[cls].shape[0] for cls in classes]}"
+            )
+            return np.zeros((query_features.shape[0], topk), dtype=np.int64)
 
-        ncm_centers_t = torch.from_numpy(np.stack(ncm_centers)).float().to(device) # [C, D]
-        query_t = torch.from_numpy(query_features).float().to(device) # [N, D]
+        ncm_centers_t = torch.from_numpy(np.stack(ncm_centers)).float().to(device)
+        query_t = torch.from_numpy(query_features).float().to(device)
         
-        # 归一化
         query_t = torch.nn.functional.normalize(query_t, p=2, dim=1)
         ncm_centers_t = torch.nn.functional.normalize(ncm_centers_t, p=2, dim=1)
         
-        # 计算 NCM 距离 (1 - cosine)
-        # [N, D] @ [D, C] -> [N, C]
         sim_ncm = torch.mm(query_t, ncm_centers_t.t())
-        dist_ncm = 1.0 - sim_ncm # [N, C]
+        dist_ncm = 1.0 - sim_ncm  # [N, C]
         
         # 计算子簇距离
-        # 我们需要构建一个大的原型矩阵，并记录每个原型属于哪个类
         all_protos = []
         proto_labels = []
         
-        for cls in classes:
+        for cls in valid_classes:
             clusters = self.class_clusters.get(cls, [])
             if clusters:
-                cls_protos = np.stack([c.center for c in clusters])
-                all_protos.append(cls_protos)
-                proto_labels.extend([cls] * len(clusters))
+                cluster_dims = [c.center.shape[0] for c in clusters]
+                if all(dim == query_dim for dim in cluster_dims):
+                    cls_protos = np.stack([c.center for c in clusters])
+                    all_protos.append(cls_protos)
+                    proto_labels.extend([cls] * len(clusters))
             else:
-                # 如果某类没有子簇（罕见），暂时用 NCM 中心代替作为子簇
-                all_protos.append(self.class_mu[cls][np.newaxis, :])
-                proto_labels.append(cls)
-                
+                if cls in self.class_mu and self.class_mu[cls].shape[0] == query_dim:
+                    all_protos.append(self.class_mu[cls][np.newaxis, :])
+                    proto_labels.append(cls)
+        
         if all_protos:
             all_protos_np = np.concatenate(all_protos, axis=0)
-            all_protos_t = torch.from_numpy(all_protos_np).float().to(device) # [TotalP, D]
+            all_protos_t = torch.from_numpy(all_protos_np).float().to(device)
             all_protos_t = torch.nn.functional.normalize(all_protos_t, p=2, dim=1)
-            proto_labels_t = torch.tensor(proto_labels, device=device) # [TotalP]
+            proto_labels_t = torch.tensor(proto_labels, device=device)
             
-            # 计算所有子簇的距离
-            # [N, D] @ [D, TotalP] -> [N, TotalP]
             sim_proto = torch.mm(query_t, all_protos_t.t())
-            dist_proto_all = 1.0 - sim_proto # [N, TotalP]
+            dist_proto_all = 1.0 - sim_proto
             
-            # 计算每类的最小子簇距离
-            # dist_sub: [N, C]
             dist_sub = torch.full_like(dist_ncm, float('inf'))
-            
-            # 优化：避免逐类循环可能较慢，但比 Python 循环快。
-            # 由于 C 通常不大 (100-1000)，循环是可接受的。
-            # 如果 C 很大，可以使用 scatter_reduce_ (需要 torch_scatter) 或特定的 reshape技巧
-            
-            # 这里使用简单的循环，因为 C 在 CIFAR/ImageNetR 中是 100/200，完全没问题
             for i, cls in enumerate(valid_classes):
-                # 找到属于该类的原型索引
                 mask = (proto_labels_t == cls)
                 if mask.any():
-                    # [N, num_protos_of_cls] -> min -> [N]
                     min_d, _ = dist_proto_all[:, mask].min(dim=1)
                     dist_sub[:, i] = min_d
                 else:
-                    # 如果没有子簇，退化为 NCM 距离
                     dist_sub[:, i] = dist_ncm[:, i]
         else:
             dist_sub = dist_ncm
+        
+        # 融合分数
+        # score = alpha * d_ncm + (1 - alpha) * d_sub
+        final_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub
+        
+        # 直接 TopK
+        k = min(topk, len(valid_classes))
+        _, indices = torch.topk(final_scores, k=k, dim=1, largest=False)
+        indices = indices.cpu().numpy()
+        
+        # 转换回原始类别ID
+        valid_classes_t = np.array(valid_classes)
+        top_preds = valid_classes_t[indices]  # [N, topk]
+        
+        return top_preds
+
+    # ------------------------------------------------------------------ #
+    # 特征漂移对齐支持
+    # ------------------------------------------------------------------ #
+    def get_class_prototypes_info(self, cls: int, k: int = 5) -> Tuple[np.ndarray, List[int]]:
+        """
+        ========================================================================
+        STAR 辅助函数：获取指定类别的 Top-K 原型节点信息
+        ========================================================================
+        
+        【功能】
+        返回指定类别中重要性最高的 Top-K 个 SOINN 节点中心，用于锚点选择。
+        
+        【重要性定义】
+        - 使用节点的 count 属性（样本计数）作为重要性指标
+        - count 越大，说明该节点代表的数据越多，是更重要的"骨架点"
+        
+        【用途】
+        在锚点选择时，我们选择 Top-K 节点对应的最近邻样本作为锚点。
+        这样可以保证锚点位于数据流形的"关节"位置，而不是边缘或低密度区域。
+        
+        【参数】
+        - cls: 类别 ID
+        - k: 返回的 Top-K 节点数量（默认 5）
+        
+        【返回】
+        - centers: [K, D] Top-K 节点中心（已归一化的单位向量）
+        - counts: [K] 每个节点的重要性（样本计数）
+        
+        【示例】
+        假设某类有 20 个节点，count 分别为 [100, 95, 80, 60, 50, ...]
+        返回 Top-5: centers=[前5个节点中心], counts=[100, 95, 80, 60, 50]
+        """
+        if cls not in self.class_clusters or len(self.class_clusters[cls]) == 0:
+            return np.zeros((0, 0)), []
+            
+        clusters = self.class_clusters[cls]
+        # 按 count 降序排列（重要性从高到低）
+        sorted_clusters = sorted(clusters, key=lambda c: c.count, reverse=True)
+        top_clusters = sorted_clusters[:k]  # 取前 k 个
+        
+        # 提取节点中心和计数
+        centers = np.stack([c.center for c in top_clusters], axis=0)  # [K, D]
+        counts = [c.count for c in top_clusters]  # [K]
+        
+        return centers, counts
+
+    def apply_rigid_transform(
+        self, cls: int, R: Optional[np.ndarray], mu_old: np.ndarray, mu_new: np.ndarray, scale: float = 1.0, base_scale: float = 1.0
+    ) -> None:
+        """
+        ========================================================================
+        STAR 核心函数：应用相似变换到 SOINN 节点 (Apply Similarity Transformation)
+        ========================================================================
+                    ncm_centers = []
+                    valid_adapter_classes = []
+                    for cls in adapter_classes:
+                        # 优先使用per-adapter的原型
+                        if (cls in self.class_mu_per_adapter and 
+                            adapter_idx in self.class_mu_per_adapter[cls] and
+                            self.class_mu_per_adapter[cls][adapter_idx] is not None):
+                            ncm_centers.append(self.class_mu_per_adapter[cls][adapter_idx])
+                            valid_adapter_classes.append(cls)
+                        elif cls in self.class_mu:
+                            # Fallback：使用完整特征的原型，提取对应的adapter段
+                            # 注意：根据CL-LoRA的对角NCM逻辑，每个类别只应该使用"属于它的adapter"的原型
+                            # 这个fallback主要用于向后兼容，正常情况下应该使用class_mu_per_adapter
+                            cls_mu = self.class_mu[cls]
+                            if cls_mu.shape[0] == out_dim:
+                                # 已经是单个adapter的特征
+                                ncm_centers.append(cls_mu)
+                                valid_adapter_classes.append(cls)
+                            elif cls_mu.shape[0] >= (adapter_idx + 1) * out_dim:
+                                # 提取对应的adapter段
+                                ncm_centers.append(cls_mu[adapter_idx * out_dim:(adapter_idx + 1) * out_dim])
+                                valid_adapter_classes.append(cls)
+                        # 其他情况跳过（如果类别在某个adapter上没有原型，就不使用该adapter的特征来预测）
+                    
+                    if not ncm_centers:
+                        adapter_logits = torch.zeros((query_segment.shape[0], end_cls - start_cls), device=device)
+                    else:
+                        # 计算当前 adapter 的相似度
+                        ncm_centers_t = torch.from_numpy(np.stack(ncm_centers)).float().to(device)
+                        query_t = torch.from_numpy(query_segment).float().to(device)
+                        
+                        query_t = torch.nn.functional.normalize(query_t, p=2, dim=1)
+                        ncm_centers_t = torch.nn.functional.normalize(ncm_centers_t, p=2, dim=1)
+                        
+                        # 计算相似度 [N, out_dim] @ [out_dim, C] -> [N, C]
+                        sim = torch.mm(query_t, ncm_centers_t.t())
+                        
+                        # 构建完整的 logits（包含所有 start_cls 到 end_cls 的类别）
+                        adapter_logits = torch.full((query_segment.shape[0], end_cls - start_cls), 
+                                                   float('-inf'), device=device)
+                        for i, cls in enumerate(valid_adapter_classes):
+                            if i < len(ncm_centers) and start_cls <= cls < end_cls:
+                                adapter_logits[:, cls - start_cls] = sim[:, i]
+                
+                all_logits.append(adapter_logits)
+            
+            # 合并所有 adapter 的 logits
+            dist_ncm = 1.0 - torch.cat(all_logits, dim=1)  # [N, total_classes]
+            valid_classes = list(range(total_classes))
+            
+        else:
+            # 标准模式：使用完整的特征
+            classes = sorted(self.class_mu.keys())
+            if len(classes) == 0:
+                fallback = np.arange(min(topk, max(total_classes, 1)), dtype=np.int64)
+                return np.tile(fallback, (query_features.shape[0], 1))
+            
+            # 构建 NCM 中心 Tensor
+            ncm_centers = []
+            valid_classes = []
+            for cls in classes:
+                cls_mu = self.class_mu[cls]
+                # 只使用维度匹配的类别
+                if cls_mu.shape[0] == query_dim:
+                    ncm_centers.append(cls_mu)
+                    valid_classes.append(cls)
+                else:
+                    logging.debug(
+                        f"Skipping class {cls} in NCM prediction: "
+                        f"class_mu dim={cls_mu.shape[0]}, query dim={query_dim}"
+                    )
+            
+            if not ncm_centers:
+                logging.warning(
+                    f"No valid NCM centers found for query dim={query_dim}. "
+                    f"Available class_mu dims: {[self.class_mu[cls].shape[0] for cls in classes]}"
+                )
+                return np.zeros((query_features.shape[0], topk), dtype=np.int64)
+
+            ncm_centers_t = torch.from_numpy(np.stack(ncm_centers)).float().to(device)
+            query_t = torch.from_numpy(query_features).float().to(device)
+            
+            query_t = torch.nn.functional.normalize(query_t, p=2, dim=1)
+            ncm_centers_t = torch.nn.functional.normalize(ncm_centers_t, p=2, dim=1)
+            
+            sim_ncm = torch.mm(query_t, ncm_centers_t.t())
+            dist_ncm = 1.0 - sim_ncm  # [N, C]
+        
+        # 计算子簇距离
+        if is_cllora_mode:
+            # CL-LoRA 模式：按 adapter 分段计算子簇距离
+            dist_sub_list = []
+            for adapter_idx in range(num_adapters):
+                query_segment = query_features[:, adapter_idx * out_dim:(adapter_idx + 1) * out_dim]
+                
+                if adapter_idx == 0:
+                    start_cls = 0
+                    end_cls = init_cls
+                else:
+                    start_cls = init_cls + (adapter_idx - 1) * inc
+                    end_cls = start_cls + inc
+                
+                adapter_classes = [cls for cls in sorted(self.class_clusters.keys()) 
+                                 if start_cls <= cls < end_cls]
+                
+                all_protos = []
+                proto_labels = []
+                
+                for cls in adapter_classes:
+                    clusters = self.class_clusters.get(cls, [])
+                    if clusters:
+                        for c in clusters:
+                            if c.center.shape[0] == out_dim:
+                                all_protos.append(c.center)
+                                proto_labels.append(cls)
+                            elif c.center.shape[0] == query_dim:
+                                all_protos.append(c.center[adapter_idx * out_dim:(adapter_idx + 1) * out_dim])
+                                proto_labels.append(cls)
+                
+                if all_protos:
+                    all_protos_np = np.stack(all_protos)
+                    all_protos_t = torch.from_numpy(all_protos_np).float().to(device)
+                    query_t_seg = torch.from_numpy(query_segment).float().to(device)
+                    
+                    all_protos_t = torch.nn.functional.normalize(all_protos_t, p=2, dim=1)
+                    query_t_seg = torch.nn.functional.normalize(query_t_seg, p=2, dim=1)
+                    
+                    sim_proto = torch.mm(query_t_seg, all_protos_t.t())
+                    dist_proto_all = 1.0 - sim_proto
+                    proto_labels_t = torch.tensor(proto_labels, device=device)
+                    
+                    # 计算每类的最小子簇距离
+                    adapter_dist_sub = torch.full((query_segment.shape[0], end_cls - start_cls), float('inf'), device=device)
+                    for cls in adapter_classes:
+                        mask = (proto_labels_t == cls)
+                        if mask.any():
+                            min_d, _ = dist_proto_all[:, mask].min(dim=1)
+                            adapter_dist_sub[:, cls - start_cls] = min_d
+                        else:
+                            # 如果没有子簇，使用 NCM 距离（需要从 dist_ncm 中提取）
+                            if cls < dist_ncm.shape[1]:
+                                adapter_dist_sub[:, cls - start_cls] = dist_ncm[:, cls]
+                    
+                    dist_sub_list.append(adapter_dist_sub)
+                else:
+                    # 没有子簇，使用 NCM 距离
+                    adapter_dist_sub = dist_ncm[:, start_cls:end_cls].clone()
+                    dist_sub_list.append(adapter_dist_sub)
+            
+            dist_sub = torch.cat(dist_sub_list, dim=1)  # [N, total_classes]
+        else:
+            # 标准模式
+            all_protos = []
+            proto_labels = []
+            
+            for cls in valid_classes:
+                clusters = self.class_clusters.get(cls, [])
+                if clusters:
+                    cluster_dims = [c.center.shape[0] for c in clusters]
+                    if all(dim == query_dim for dim in cluster_dims):
+                        cls_protos = np.stack([c.center for c in clusters])
+                        all_protos.append(cls_protos)
+                        proto_labels.extend([cls] * len(clusters))
+                else:
+                    if cls in self.class_mu and self.class_mu[cls].shape[0] == query_dim:
+                        all_protos.append(self.class_mu[cls][np.newaxis, :])
+                        proto_labels.append(cls)
+            
+            if all_protos:
+                all_protos_np = np.concatenate(all_protos, axis=0)
+                all_protos_t = torch.from_numpy(all_protos_np).float().to(device)
+                all_protos_t = torch.nn.functional.normalize(all_protos_t, p=2, dim=1)
+                proto_labels_t = torch.tensor(proto_labels, device=device)
+                
+                sim_proto = torch.mm(query_t, all_protos_t.t())
+                dist_proto_all = 1.0 - sim_proto
+                
+                dist_sub = torch.full_like(dist_ncm, float('inf'))
+                for i, cls in enumerate(valid_classes):
+                    mask = (proto_labels_t == cls)
+                    if mask.any():
+                        min_d, _ = dist_proto_all[:, mask].min(dim=1)
+                        dist_sub[:, i] = min_d
+                    else:
+                        dist_sub[:, i] = dist_ncm[:, i]
+            else:
+                dist_sub = dist_ncm
             
         # 融合分数
         # score = alpha * d_ncm + (1 - alpha) * d_sub
@@ -729,34 +980,34 @@ class HCSOINNClassifier:
     # 特征漂移对齐支持
     # ------------------------------------------------------------------ #
     def get_class_prototypes_info(self, cls: int, k: int = 5) -> Tuple[np.ndarray, List[int]]:
-        """
-        ========================================================================
-        STAR 辅助函数：获取指定类别的 Top-K 原型节点信息
-        ========================================================================
+        # """
+        # ========================================================================
+        # STAR 辅助函数：获取指定类别的 Top-K 原型节点信息
+        # ========================================================================
         
-        【功能】
-        返回指定类别中重要性最高的 Top-K 个 SOINN 节点中心，用于锚点选择。
+        # 【功能】
+        # 返回指定类别中重要性最高的 Top-K 个 SOINN 节点中心，用于锚点选择。
         
-        【重要性定义】
-        - 使用节点的 count 属性（样本计数）作为重要性指标
-        - count 越大，说明该节点代表的数据越多，是更重要的"骨架点"
+        # 【重要性定义】
+        # - 使用节点的 count 属性（样本计数）作为重要性指标
+        # - count 越大，说明该节点代表的数据越多，是更重要的"骨架点"
         
-        【用途】
-        在锚点选择时，我们选择 Top-K 节点对应的最近邻样本作为锚点。
-        这样可以保证锚点位于数据流形的"关节"位置，而不是边缘或低密度区域。
+        # 【用途】
+        # 在锚点选择时，我们选择 Top-K 节点对应的最近邻样本作为锚点。
+        # 这样可以保证锚点位于数据流形的"关节"位置，而不是边缘或低密度区域。
         
-        【参数】
-        - cls: 类别 ID
-        - k: 返回的 Top-K 节点数量（默认 5）
+        # 【参数】
+        # - cls: 类别 ID
+        # - k: 返回的 Top-K 节点数量（默认 5）
         
-        【返回】
-        - centers: [K, D] Top-K 节点中心（已归一化的单位向量）
-        - counts: [K] 每个节点的重要性（样本计数）
+        # 【返回】
+        # - centers: [K, D] Top-K 节点中心（已归一化的单位向量）
+        # - counts: [K] 每个节点的重要性（样本计数）
         
-        【示例】
-        假设某类有 20 个节点，count 分别为 [100, 95, 80, 60, 50, ...]
-        返回 Top-5: centers=[前5个节点中心], counts=[100, 95, 80, 60, 50]
-        """
+        # 【示例】
+        # 假设某类有 20 个节点，count 分别为 [100, 95, 80, 60, 50, ...]
+        # 返回 Top-5: centers=[前5个节点中心], counts=[100, 95, 80, 60, 50]
+        # """
         if cls not in self.class_clusters or len(self.class_clusters[cls]) == 0:
             return np.zeros((0, 0)), []
             

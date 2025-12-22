@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from utils.inc_net import EaseNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
+from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
 
 num_workers = 8
 
@@ -41,7 +42,44 @@ class Learner(BaseLearner):
             self.alpha = 1 
             self.beta = 1
 
+        # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
+        self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
+        self.cluster_analyzer = None  # 簇结构分析器（延迟初始化）
+
+        if self.analyze_cluster_structure_drift:
+            logging.info("簇结构分析实验启用：将计算Procrustes距离验证特征漂移时簇结构是否改变")
+            # 定义特征提取函数（适配 EASE 的网络结构）
+            def feature_extractor(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module.extract_vector(x)
+                else:
+                    feats = self._network.extract_vector(x)
+                return feats
+
+            self.cluster_analyzer = ClusterStructureAnalyzer(
+                feature_extractor=feature_extractor,
+                device=self._device,
+                args=args
+            )
+
     def after_task(self):
+        # 簇结构分析实验：保存Task 1样本或计算Procrustes距离
+        if self.cluster_analyzer is not None:
+            if self._cur_task == 0:
+                # Task 1结束后：保存所有训练样本
+                init_cls = self.args.get("init_cls", 10)
+                dataset_loader = lambda: self.data_manager.get_dataset(
+                    np.arange(0, init_cls), source="train", mode="test"
+                )
+                self.cluster_analyzer.save_task1_samples(
+                    dataset_loader=dataset_loader,
+                    batch_size=self.batch_size,
+                    num_workers=num_workers
+                )
+            else:
+                # 后续任务：计算Procrustes距离
+                self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
+
         self._known_classes = self._total_classes
         self._network.freeze()
         self._network.backbone.add_adapter_to_list()
@@ -328,6 +366,8 @@ class Learner(BaseLearner):
                     aux_targets - self._known_classes,
                     -1,
                 )
+                # 确保 aux_targets 是 long 类型（cross_entropy 要求）
+                aux_targets = aux_targets.long()
                 
                 output = self._network(inputs, test=False)
                 logits = output["logits"]
@@ -348,7 +388,18 @@ class Learner(BaseLearner):
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+            if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
+                test_acc = self._compute_accuracy(self._network, test_loader)
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                    self._cur_task,
+                    epoch + 1,
+                    epochs,
+                    losses / len(train_loader),
+                    train_acc,
+                    test_acc,
+                )
+            else:
+                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     epochs,
