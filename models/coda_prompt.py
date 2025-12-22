@@ -15,6 +15,7 @@ from utils.knn_classifier import KNNClassifier
 from utils.soinn_classifier import SOINNClassifier
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.star_alignment import STARAlignment
+from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
 import os
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
@@ -103,6 +104,26 @@ class Learner(BaseLearner):
         if self.test_only_first_task_classes:
             self.init_cls = args.get("init_cls", 10)
             logging.info(f"实验模式启用：只测试第一个任务的类别 (0-{self.init_cls-1})，用于分析特征漂移影响")
+        
+        # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
+        self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
+        self.cluster_analyzer = None  # 簇结构分析器（延迟初始化）
+        
+        if self.analyze_cluster_structure_drift:
+            logging.info("簇结构分析实验启用：将计算Procrustes距离验证特征漂移时簇结构是否改变")
+            # 定义特征提取函数（适配 CodaPrompt 的网络结构）
+            def feature_extractor(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module.extract_vector(x)
+                else:
+                    feats = self._network.extract_vector(x)
+                return feats
+            
+            self.cluster_analyzer = ClusterStructureAnalyzer(
+                feature_extractor=feature_extractor,
+                device=self._device,
+                args=args
+            )
         
         # 如果启用特征对齐且使用 HC-SOINN，初始化 STAR
         if self.use_feature_alignment and self.use_hc_soinn:
@@ -214,7 +235,24 @@ class Learner(BaseLearner):
             except Exception as e:
                 logging.error(f"Error during KNN prune_zero_usage in coda_prompt.after_task: {e}", exc_info=True)
 
-        # 5. 更新已知类别数
+        # 5. 簇结构分析实验：保存Task 1样本或计算Procrustes距离
+        if self.cluster_analyzer is not None:
+            if self._cur_task == 0:
+                # Task 1结束后：保存所有训练样本
+                init_cls = self.args.get("init_cls", 10)
+                dataset_loader = lambda: self.data_manager.get_dataset(
+                    np.arange(0, init_cls), source="train", mode="test"
+                )
+                self.cluster_analyzer.save_task1_samples(
+                    dataset_loader=dataset_loader,
+                    batch_size=self.batch_size,
+                    num_workers=num_workers
+                )
+            else:
+                # 后续任务：计算Procrustes距离
+                self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
+        
+        # 6. 更新已知类别数
         self._known_classes = self._total_classes
 
         # 6. 保存checkpoint（每个任务训练完后）
@@ -1069,7 +1107,6 @@ class Learner(BaseLearner):
             results["ncm"] = self._evaluate(y_pred_ncm, y_true_ncm)
         
         return results
-    
 
     def _compute_accuracy(self, model, loader):
         model.eval()
