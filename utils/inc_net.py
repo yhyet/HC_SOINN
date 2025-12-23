@@ -692,9 +692,20 @@ class SEMAVitNet(BaseNet):
         super().__init__(args, pretrained)
         self.fc = None
         self.args = args
+        # NCM分类器：用于存储类均值的FC层（使用CosineLinear，自动归一化）
+        self.ncm_fc = CosineLinear(768, args["nb_classes"], sigma=False)
+
+    @property
+    def feature_dim(self):
+        """重写feature_dim property，返回固定的768维度"""
+        return 768
 
     def extract_vector(self, x):
-        return self.backbone(x)
+        out = self.backbone(x)
+        # SEMA 的 backbone 返回字典，需要提取 "features"
+        if isinstance(out, dict):
+            return out["features"]
+        return out
 
     def forward(self, x):
         out = self.backbone(x)

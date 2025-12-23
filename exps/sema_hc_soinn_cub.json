@@ -1,6 +1,6 @@
 {
-    "prefix": "ncm",
-    "dataset": "cifar224",
+    "prefix": "reproduce",
+    "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
@@ -43,8 +43,10 @@
     "hcsoinn_use_soinn_refinement": true,
     "hcsoinn_soinn_ad": 20,
     "hcsoinn_soinn_lam": 20,
-    "hcsoinn_soinn_threshold_scale": 0.8,
-    "hcsoinn_soinn_max_iter": 1,
-    "hcsoinn_soinn_max_degree_for_removal": 1
+    "hcsoinn_soinn_threshold_scale": 0.5,
+    "hcsoinn_soinn_max_iter": 3,
+    "hcsoinn_soinn_max_degree_for_removal": 1,
+
+    "analyze_cluster_structure_drift": true
 }
 
