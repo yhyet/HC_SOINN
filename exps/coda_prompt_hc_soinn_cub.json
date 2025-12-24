@@ -40,7 +40,7 @@
     "hcsoinn_soinn_threshold_scale": 0.5,
     "hcsoinn_soinn_max_iter": 3,
 
-    "save_checkpoint": true,
+    "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_hc_soinn_cub",
     "load_all_checkpoints": false,
