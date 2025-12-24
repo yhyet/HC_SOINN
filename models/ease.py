@@ -100,17 +100,16 @@ class Learner(BaseLearner):
                 # 后续任务：计算Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
 
-        # ========== Step 1: 压缩 HC-SOINN（生成当前任务的节点）==========
-        # 目的：为当前任务的新类别生成 SOINN 原型节点
+        self._known_classes = self._total_classes
+        self._network.freeze()
+        self._network.backbone.add_adapter_to_list()
+        
+        # 压缩 HC-SOINN（生成当前任务的节点，在adapter添加之后）
         if getattr(self, "use_hc_soinn", False):
             try:
                 self.hc_soinn.compress()
             except Exception as e:
                 logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
-
-        self._known_classes = self._total_classes
-        self._network.freeze()
-        self._network.backbone.add_adapter_to_list()
     
     def get_cls_range(self, task_id):
         if task_id == 0:
@@ -316,7 +315,7 @@ class Learner(BaseLearner):
             self._network = self._network.module
         self.replace_fc(self.train_loader_for_protonet)
         
-        # 构建 HC-SOINN bank（如果启用）
+        # 构建 HC-SOINN bank（在after_task之前，此时cur_adapter是当前任务的已训练版本）
         if getattr(self, "use_hc_soinn", False):
             self._build_hc_soinn_bank()
 
@@ -539,8 +538,8 @@ class Learner(BaseLearner):
     def _build_hc_soinn_bank(self):
         """
         构建 HC-SOINN bank：类增量学习场景下的累积存储
-        - 每个任务只使用当前任务的新类别训练数据（符合类增量学习设定）
-        - 旧类别的信息通过已保存的簇中心保留（在 compress 时合并）
+        - 每个任务重新计算所有已见过的类别的特征（使用当前特征维度）
+        - 确保所有类别的特征维度一致，避免维度不匹配问题
         """
         if not self.use_hc_soinn:
             return
@@ -548,10 +547,6 @@ class Learner(BaseLearner):
         # 确保模型处于 eval 模式（重要：特征提取时应该关闭 dropout 等）
         self._network.eval()
 
-        hc_bank_empty = (not hasattr(self, "hc_soinn")) or (len(getattr(self.hc_soinn, "class_clusters", {})) == 0)
-        if hc_bank_empty:
-            logging.info(f"HC-SOINN bank is empty!!!")
-        
         feature_fn = self._get_hc_soinn_feature_fn()
 
         def add_from_loader(loader):
@@ -568,22 +563,31 @@ class Learner(BaseLearner):
                 return
             feats_np = np.concatenate(feats, axis=0)
             lbs_np = np.concatenate(lbs, axis=0)
-            # HC-SOINN 标准模式：存储完整特征的原型
-            self.hc_soinn.add_features(feats_np, lbs_np)
+            return feats_np, lbs_np
 
-        # 类增量学习：每个任务只使用当前任务的新类别训练数据
-        logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
-        current_task_dataset = self.data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes), source="train", mode="test"
+        # 重新计算所有已见过的类别的特征（使用当前特征维度）
+        # 使用测试数据，因为训练数据可能不可用（类增量学习设定）
+        logging.info(f"Building HC-SOINN bank: recomputing all seen classes (0-{self._total_classes-1}) with current feature dimension")
+        all_classes_dataset = self.data_manager.get_dataset(
+            np.arange(0, self._total_classes), source="test", mode="test"
         )
-        current_task_loader = DataLoader(
-            current_task_dataset,
+        all_classes_loader = DataLoader(
+            all_classes_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             drop_last=False,
             num_workers=num_workers,
         )
-        add_from_loader(current_task_loader)
+        feats_np, lbs_np = add_from_loader(all_classes_loader)
+        
+        if feats_np is not None and len(feats_np) > 0:
+            # 清空旧的特征（避免维度不匹配）
+            self.hc_soinn.class_mu = {}
+            self.hc_soinn.class_count = {}
+            self.hc_soinn.class_clusters = {}
+            self.hc_soinn.buffers = {}
+            # 添加所有类别的特征（使用当前特征维度）
+            self.hc_soinn.add_features(feats_np, lbs_np)
 
     def _eval_hc_soinn(self, loader):
         """
