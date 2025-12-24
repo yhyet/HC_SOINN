@@ -34,7 +34,7 @@
     "soinn_threshold_scale": 0.75,
     "soinn_k_neighbors": 3,
 
-    "save_checkpoint": true,
+    "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_soinn_inr",
     "load_all_checkpoints": false

@@ -33,7 +33,7 @@
     "knn_k": 5,
     "knn_upperbound": false,
 
-    "save_checkpoint": true,
+    "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_inr_knn",
     "load_all_checkpoints": false

@@ -114,7 +114,9 @@ class Learner(BaseLearner):
                 self._network.to(self._device)
             else:
                 self._init_train(train_loader, test_loader, optimizer, scheduler)
-                self.save_checkpoint("{}_{}_{}_{}".format(self.args["dataset"],self.args["model_name"],self.args["init_cls"],self.args["increment"]))
+                # Checkpoint saving disabled to save storage space
+                # if self.args.get("save_checkpoint", False):
+                #     self.save_checkpoint("{}_{}_{}_{}".format(self.args["dataset"],self.args["model_name"],self.args["init_cls"],self.args["increment"]))
                 self._network.to(self._device)
         
         self.replace_fc(train_loader_for_protonet, self._network, None)
