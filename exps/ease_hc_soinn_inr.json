@@ -1,5 +1,5 @@
 {
-    "prefix": "reproduce",
+    "prefix": " ",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -7,31 +7,34 @@
     "shuffle": true,
     "init_cls": 20,
     "increment": 20,
-    "model_name": "sema",
-    "backbone_type": "pretrained_vit_b16_224_adapter",
+    "model_name": "ease",
+    "backbone_type": "vit_base_patch16_224_ease",
     "device": ["0"],
     "seed": [1993],
     
-    "batch_size": 32,
-    "weight_decay": 0.0005,
+    "init_epochs": 20,
+    "init_lr": 0.05,
+    "later_epochs": 20,
+    "later_lr": 0.05,
+    "batch_size": 16,
+    "weight_decay": 0.005,
     "min_lr": 0,
-    "ffn_adapter_type": "adaptmlp",
-    "ffn_num": 16,
     "optimizer": "sgd",
-    "vpt_type": "shallow",
+    "scheduler": "cosine",
+    "pretrained": true,
+    "vpt_type": "Deep",
     "prompt_token_num": 5,
-
-    "func_epoch": 20,
-    "rd_epoch": 20,
-    "init_lr": 0.005,
-    "rd_lr": 0.01,
-    "rd_dim": 128,
-    "buffer_size": 500,
-    "detect_batch_size": 128,
-
-    "exp_threshold": 2,
-    "adapt_start_layer": 9,
-    "adapt_end_layer": 11,
+    "ffn_num": 64,
+    "use_diagonal": false,
+    "recalc_sim": true,
+    "alpha": 0.1,
+    "use_init_ptm": false,
+    "beta": 0,
+    "use_old_data": false,
+    "use_reweight": true,
+    
+    "moni_adam": false,
+    "adapter_num": -1,
 
     "use_hc_soinn": true,
     "hcsoinn_max_proto_per_class": 60,
@@ -45,9 +48,6 @@
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.8,
     "hcsoinn_soinn_max_iter": 1,
-    "hcsoinn_soinn_max_degree_for_removal": 1,
-
-    "analyze_cluster_structure_drift": true,
-    "use_feature_alignment": true
+    "hcsoinn_soinn_max_degree_for_removal": 1
 }
 

@@ -14,6 +14,7 @@ from utils.toolkit import tensor2numpy
 from backbone.sema_block import SEMAModules
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
+from utils.star_alignment import STARAlignment
 
 num_workers = 8
 
@@ -73,8 +74,73 @@ class Learner(BaseLearner):
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
+        
+        # HC-SOINN 特征漂移对齐配置 (STAR)
+        self.use_feature_alignment = args.get("use_feature_alignment", False)
+        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
+        self.star = None  # STAR 对齐器（延迟初始化）
+        
+        # 如果启用特征对齐且使用 HC-SOINN，初始化 STAR
+        if self.use_feature_alignment and self.use_hc_soinn:
+            # 定义特征提取函数（适配 SEMA 的网络结构）
+            def feature_extractor(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module.extract_vector(x)
+                else:
+                    feats = self._network.extract_vector(x)
+                # SEMA 的 extract_vector 返回字典，需要提取 "features"
+                if isinstance(feats, dict):
+                    feats = feats["features"]
+                return feats
+            
+            self.star = STARAlignment(
+                hc_soinn=self.hc_soinn,
+                feature_extractor=feature_extractor,
+                device=self._device,
+                use_full_task_rehearsal=self.use_full_task_rehearsal,
+            )
+            if self.use_full_task_rehearsal:
+                logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
+            else:
+                logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
 
     def after_task(self):
+        """
+        ========================================================================
+        STAR (Structure-Topology Alignment via Residuals) Pipeline
+        ========================================================================
+        每个 task 结束后的统一处理流程（STAR 特征漂移对齐的核心入口）：
+        
+        【Pipeline 流程说明】
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Task t 训练结束，Backbone 已更新为 f_t                          │
+        └─────────────────────────────────────────────────────────────────┘
+                              ↓
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Step 1: 漂移对齐 (Drift Alignment)                              │
+        │   - 对旧类别 (C_0, ..., C_{t-1}) 的 SOINN 节点进行相似变换校正  │
+        │   - 使用保存的锚点计算 Procrustes 变换 (R, s, t)                │
+        │   - 将旧节点从 f_{t-1} 空间对齐到 f_t 空间                      │
+        └─────────────────────────────────────────────────────────────────┘
+                              ↓
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Step 2: 压缩 (Compress)                                          │
+        │   - 对当前任务 (C_t) 的训练数据生成 SOINN 节点                  │
+        │   - 使用层次聚类压缩，生成有限数量的原型                        │
+        └─────────────────────────────────────────────────────────────────┘
+                              ↓
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ Step 3: 锚点选择 (Anchor Selection)                              │
+        │   - 为当前任务 (C_t) 的每个类别选择 Top-K 锚点                  │
+        │   - 基于 SOINN 拓扑骨架（重要性最高的节点）选择最近邻样本        │
+        │   - 保存锚点图片和特征，用于下一轮 (Task t+1) 的漂移对齐        │
+        └─────────────────────────────────────────────────────────────────┘
+        
+        【关键设计】
+        - 顺序很重要：必须先对齐旧类，再压缩新类，最后选锚点
+        - 锚点只保存当前任务的，旧任务的锚点在上一轮已经更新过特征
+        - 对齐操作会同时更新 SOINN 节点和 NCM 类中心
+        """
         # 簇结构分析实验：保存Task 0样本或计算Procrustes距离
         if self.cluster_analyzer is not None:
             if self._cur_task == 0:
@@ -93,12 +159,36 @@ class Learner(BaseLearner):
                 # 后续任务（Task 1, 2, ...）：计算与Task 0的Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
         
-        # HC-SOINN compress: 每个任务结束后压缩当前任务的特征
+        # ========== Step 1: 特征漂移对齐（针对旧类别）==========
+        # 目的：将旧类别的 SOINN 节点从旧模型空间对齐到新模型空间
+        # 使用 STAR 模块进行对齐
+        if self.star is not None:
+            self.star.align_old_classes(self._cur_task)
+
+        # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
+        # 目的：为当前任务的新类别生成 SOINN 原型节点
+        # 输入：self.hc_soinn.buffers (当前任务的训练特征)
+        # 输出：更新 self.hc_soinn.class_clusters (新增当前任务的节点)
         if getattr(self, "use_hc_soinn", False):
             try:
                 self.hc_soinn.compress()
             except Exception as e:
                 logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
+                
+        # ========== Step 3: 为当前任务选择锚点（用于下一轮对齐）==========
+        # 目的：为当前任务的每个类别选择 Top-K 锚点，保存用于下一轮漂移对齐
+        # 使用 STAR 模块进行锚点选择
+        if self.star is not None:
+            # 获取当前任务的训练数据集
+            dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train", mode="test"
+            )
+            self.star.select_anchors_for_current_task(
+                dataset=dataset,
+                batch_size=self.batch_size,
+                num_workers=num_workers
+            )
         
         self._known_classes = self._total_classes
 
