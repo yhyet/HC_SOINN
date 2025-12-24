@@ -209,3 +209,4 @@ def after_task(self):
 
 EASE模型中的HC-SOINN集成缺少**特征漂移对齐（STAR）机制**，这是导致准确率急剧下降的根本原因。需要参考SEMA模型的实现，添加完整的STAR对齐流程。
 
+
