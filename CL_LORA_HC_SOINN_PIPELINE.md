@@ -331,3 +331,4 @@ def _get_hc_soinn_feature_fn(self):
 2. **数据模式**：使用 `mode="test"` 关闭数据增强
 3. **压缩时机**：在 `after_task()` 中统一处理，确保所有后处理完成后再压缩
 
+

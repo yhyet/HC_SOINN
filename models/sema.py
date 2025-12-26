@@ -159,11 +159,16 @@ class Learner(BaseLearner):
                 # 后续任务（Task 1, 2, ...）：计算与Task 0的Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
         
+        # ========== Prepare current task class set ==========
+        # Get the classes that belong to the current task (to exclude from alignment)
+        current_task_classes = set(range(self._known_classes, self._total_classes))
+        
         # ========== Step 1: 特征漂移对齐（针对旧类别）==========
         # 目的：将旧类别的 SOINN 节点从旧模型空间对齐到新模型空间
         # 使用 STAR 模块进行对齐
+        # IMPORTANT: Pass current_task_classes to avoid aligning classes that were just saved
         if self.star is not None:
-            self.star.align_old_classes(self._cur_task)
+            self.star.align_old_classes(self._cur_task, current_task_classes=current_task_classes)
 
         # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
         # 目的：为当前任务的新类别生成 SOINN 原型节点

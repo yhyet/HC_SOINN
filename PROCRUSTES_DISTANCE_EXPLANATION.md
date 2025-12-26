@@ -128,3 +128,4 @@ Procrustes 距离用于测量**特征漂移**（Feature Drift）：
 3. **归一化**：最终距离是归一化的（0-1 范围），便于比较不同规模的数据
 4. **CL-LoRA 特殊处理**：只使用 general_lora，排除 specific_lora 的影响
 
+

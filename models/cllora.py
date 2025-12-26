@@ -194,10 +194,15 @@ class Learner(BaseLearner):
         ========================================================================
         每个 task 结束后的统一处理流程（STAR 特征漂移对齐的核心入口）
         """
+        # ========== Prepare current task class set ==========
+        # Get the classes that belong to the current task (to exclude from alignment)
+        current_task_classes = set(range(self._known_classes, self._total_classes))
+        
         # ========== Step 1: 特征漂移对齐（针对旧类别）==========
         # 目的：将旧类别的 SOINN 节点从旧模型空间对齐到新模型空间
+        # IMPORTANT: Pass current_task_classes to avoid aligning classes that were just saved
         if self.star is not None:
-            self.star.align_old_classes(self._cur_task)
+            self.star.align_old_classes(self._cur_task, current_task_classes=current_task_classes)
 
         # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
         # 目的：为当前任务的新类别生成 SOINN 原型节点

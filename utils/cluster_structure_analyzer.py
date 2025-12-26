@@ -131,11 +131,14 @@ class ClusterStructureAnalyzer:
             images_tensor = torch.stack(images_dict[cls])  # [N_cls, C, H, W]
             feats_array = np.array(feats_dict[cls])  # [N_cls, D]
             
+            # Normalize features to work in normalized space (consistent with STAR)
+            feats_array_norm = feats_array / (np.linalg.norm(feats_array, axis=1, keepdims=True) + 1e-8)
+            
             self._cluster_samples[cls] = {
                 'images': images_tensor,
-                'feats_task1': feats_array
+                'feats_task1': feats_array_norm  # Store NORMALIZED features
             }
-            logging.info(f"[Cluster Structure Analysis] Saved {len(images_dict[cls])} samples for class {cls}")
+            logging.info(f"[Cluster Structure Analysis] Saved {len(images_dict[cls])} samples for class {cls} (normalized)")
         
         logging.info(f"[Cluster Structure Analysis] Task 1 samples saved for {len(self._cluster_samples)} classes")
     
@@ -176,8 +179,11 @@ class ClusterStructureAnalyzer:
             
             feats_current = np.concatenate(feats_current, axis=0)  # [N_cls, D]
             
-            # 计算Procrustes距离
-            procrustes_dist = self._compute_procrustes_distance(feats_task1, feats_current)
+            # Normalize current features to work in normalized space
+            feats_current_norm = feats_current / (np.linalg.norm(feats_current, axis=1, keepdims=True) + 1e-8)
+            
+            # 计算Procrustes距离 (in normalized space)
+            procrustes_dist = self._compute_procrustes_distance(feats_task1, feats_current_norm)
             self._procrustes_distances[cur_task][cls] = procrustes_dist
             
             distances_summary.append({
@@ -204,14 +210,18 @@ class ClusterStructureAnalyzer:
     
     def _compute_procrustes_distance(self, X1: np.ndarray, X2: np.ndarray) -> float:
         """
-        计算两个点集之间的Procrustes距离
+        计算两个点集之间的Procrustes距离（在归一化空间中）
         
         参数:
-            X1: 参考点集 [N, D]
-            X2: 目标点集 [N, D]
+            X1: 参考点集 [N, D] (already normalized)
+            X2: 目标点集 [N, D] (already normalized)
         
         返回:
             Procrustes距离（归一化后的Frobenius范数）
+        
+        注意：
+            - 输入特征应该已经归一化（单位范数）
+            - 在归一化空间中，只计算旋转，不计算缩放
         """
         if X1.shape != X2.shape:
             raise ValueError(f"Shape mismatch: X1 {X1.shape} vs X2 {X2.shape}")
@@ -231,49 +241,16 @@ class ClusterStructureAnalyzer:
         U, S, Vt = np.linalg.svd(M, full_matrices=False)
         R = np.dot(U, Vt)  # [D, D] 正交旋转矩阵
         
-        # 修正：计算最优缩放因子 s
-        # 标准Procrustes分析中，最优缩放因子为：
-        # s = trace(X1^T @ X2 @ R) / trace(X1^T @ X1)
-        # 但需要注意：如果trace为负，说明需要反射（reflection），这里我们只考虑旋转
-        # 更稳健的方法：先计算旋转后的X1，然后计算缩放因子
-        X1_rotated = np.dot(X1_centered, R)  # [N, D]
+        # In normalized space, we only apply rotation (no scaling)
+        # Apply rotation: X1_aligned = X1_centered @ R
+        X1_aligned = np.dot(X1_centered, R)  # [N, D]
         
-        # 计算最优缩放因子：最小化 ||X2 - s * X1_rotated||_F^2
-        # 对s求导并令其为0：s = trace(X1_rotated^T @ X2) / trace(X1_rotated^T @ X1_rotated)
-        trace_X1_rotated_sq = np.trace(np.dot(X1_rotated.T, X1_rotated))
-        if trace_X1_rotated_sq > 1e-10:
-            trace_X1_rotated_X2 = np.trace(np.dot(X1_rotated.T, X2_centered))
-            s = float(trace_X1_rotated_X2 / trace_X1_rotated_sq)
-            # 确保缩放因子非负（如果为负，说明需要反射，但我们只考虑旋转+缩放）
-            if s < 0:
-                # 如果缩放因子为负，使用Frobenius范数比作为fallback
-                norm_X1 = np.linalg.norm(X1_centered, ord='fro')
-                norm_X2 = np.linalg.norm(X2_centered, ord='fro')
-                s = float(norm_X2 / norm_X1) if norm_X1 > 1e-10 else 1.0
-        else:
-            # Fallback: 使用 Frobenius 范数比（当trace接近0时）
-            norm_X1 = np.linalg.norm(X1_centered, ord='fro')
-            norm_X2 = np.linalg.norm(X2_centered, ord='fro')
-            if norm_X1 > 1e-10:
-                s = float(norm_X2 / norm_X1)
-            else:
-                s = 1.0
+        # Compute Procrustes distance: Frobenius norm of residual after alignment
+        # Normalize by sqrt(N) to make distance independent of sample count
+        residual = X2_centered - X1_aligned  # [N, D]
+        procrustes_dist = np.linalg.norm(residual, ord='fro') / np.sqrt(X1.shape[0])
         
-        # 计算变换后的X1（使用已计算的X1_rotated）
-        X1_transformed = s * X1_rotated  # [N, D]
-        
-        # 计算Procrustes距离（Frobenius范数）
-        diff = X2_centered - X1_transformed
-        procrustes_dist = np.linalg.norm(diff, ord='fro')
-        
-        # 归一化：除以X2的Frobenius范数
-        norm_X2 = np.linalg.norm(X2_centered, ord='fro')
-        if norm_X2 > 1e-10:
-            normalized_dist = procrustes_dist / norm_X2
-        else:
-            normalized_dist = 0.0
-        
-        return float(normalized_dist)
+        return float(procrustes_dist)
     
     def _save_procrustes_results(self) -> None:
         """

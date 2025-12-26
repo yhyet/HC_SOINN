@@ -129,10 +129,26 @@ class Learner(BaseLearner):
         if self.use_feature_alignment and self.use_hc_soinn:
             # 定义特征提取函数（适配 CodaPrompt 的网络结构）
             def feature_extractor(x):
-                if isinstance(self._network, nn.DataParallel):
-                    feats = self._network.module(x, pen=True, train=False)
-                else:
-                    feats = self._network(x, pen=True, train=False)
+                # DEBUG: Log task_count when extracting features
+                try:
+                    if isinstance(self._network, nn.DataParallel):
+                        task_count = self._network.module.prompt.task_count if self._network.module.prompt is not None else -1
+                        feats = self._network.module(x, pen=True, train=False)
+                    else:
+                        task_count = self._network.prompt.task_count if self._network.prompt is not None else -1
+                        feats = self._network(x, pen=True, train=False)
+                    
+                    # Only log once per batch to avoid spam
+                    if not hasattr(feature_extractor, '_logged_task_count') or feature_extractor._logged_task_count != task_count:
+                        logging.info(f"[STAR DEBUG] Feature extraction using task_count={task_count}")
+                        feature_extractor._logged_task_count = task_count
+                except Exception as e:
+                    logging.warning(f"[STAR DEBUG] Could not log task_count: {e}")
+                    if isinstance(self._network, nn.DataParallel):
+                        feats = self._network.module(x, pen=True, train=False)
+                    else:
+                        feats = self._network(x, pen=True, train=False)
+                
                 if isinstance(feats, tuple):
                     feats = feats[0]
                 return feats
@@ -190,11 +206,37 @@ class Learner(BaseLearner):
         - 锚点只保存当前任务的，旧任务的锚点在上一轮已经更新过特征
         - 对齐操作会同时更新 SOINN 节点和 NCM 类中心
         """
+        # ========== Prepare current task class set ==========
+        # Get the classes that belong to the current task (to exclude from alignment)
+        current_task_classes = set(range(self._known_classes, self._total_classes))
+        
+        # ========== DEBUG: Save snapshot BEFORE alignment ==========
+        # Purpose: Track how SOINN nodes change due to STAR alignment
+        # 只在对应任务记录一次：class 0-9 在 Task 2 记录，class 10-19 在 Task 3 记录，以此类推
+        if self.use_hc_soinn and self._cur_task >= 2:
+            # 计算当前任务应该记录的类组：Task 2 记录 class 0-9, Task 3 记录 class 10-19, ...
+            class_group_start = (self._cur_task - 2) * 10
+            class_group_end = class_group_start + 10
+            
+            # 确保不超过总类别数
+            if class_group_start < self._total_classes:
+                class_group_end = min(class_group_end, self._total_classes)
+                classes_to_log = list(range(class_group_start, class_group_end))
+                
+                self.hc_soinn.save_cluster_snapshot(self._cur_task, classes_to_log)
+                logging.info(f"[DEBUG] Saved snapshot for Task {self._cur_task} (before alignment, classes {class_group_start}-{class_group_end-1})")
+                
+                # 只在首次记录时比较（Task 2 比较 Task 1 vs Task 2，Task 3 比较 Task 2 vs Task 3，...）
+                if self._cur_task >= 2:
+                    logging.info(f"[DEBUG] ========== Comparing snapshots: Task {self._cur_task - 1} vs Task {self._cur_task} (classes {class_group_start}-{class_group_end-1}) ==========")
+                    self.hc_soinn.compare_cluster_snapshots(self._cur_task - 1, self._cur_task, classes_to_log)
+        
         # ========== Step 1: 特征漂移对齐（针对旧类别）==========
         # 目的：将旧类别的 SOINN 节点从旧模型空间对齐到新模型空间
         # 使用 STAR 模块进行对齐
+        # IMPORTANT: Pass current_task_classes to avoid aligning classes that were just saved
         if self.star is not None:
-            self.star.align_old_classes(self._cur_task)
+            self.star.align_old_classes(self._cur_task, current_task_classes=current_task_classes)
 
         # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
         # 目的：为当前任务的新类别生成 SOINN 原型节点
@@ -1095,6 +1137,36 @@ class Learner(BaseLearner):
         
         # 3. 使用 HC-SOINN / SOINN 分类器评估（互斥）
         if getattr(self, "use_hc_soinn", False):
+            # DEBUG: Save Inference Snapshot to verify if nodes are truly frozen during inference
+            # 按任务记录调试信息：
+            # - class 0-9: 在 Task 2 记录
+            # - class 10-19: 在 Task 3 记录
+            # - class 20-29: 在 Task 4 记录
+            # - 以此类推：class (k*10) 到 (k*10+9) 在 Task (k+2) 记录
+            
+            # 计算当前任务应该记录哪些类组的调试信息
+            # Task 2 记录 class 0-9, Task 3 记录 class 10-19, Task 4 记录 class 20-29, ...
+            if self._cur_task >= 2:
+                # 当前任务应该记录的类组：class (cur_task-2)*10 到 (cur_task-2)*10+9
+                class_group_start = (self._cur_task - 2) * 10
+                class_group_end = class_group_start + 10
+                
+                # 确保不超过总类别数
+                if class_group_start < self._total_classes:
+                    class_group_end = min(class_group_end, self._total_classes)
+                    classes_to_log = list(range(class_group_start, class_group_end))
+                    
+                    # 使用 task_id + 1000 来区分对齐快照和推理快照
+                    inference_task_id = self._cur_task + 1000
+                    self.hc_soinn.save_cluster_snapshot(inference_task_id, classes_to_log)
+                    logging.info(f"[DEBUG] Saved INFERENCE snapshot for Task {self._cur_task} (classes {class_group_start}-{class_group_end-1})")
+                    
+                    # 与上一个任务的快照比较
+                    if self._cur_task >= 3:
+                        prev_inference_task_id = (self._cur_task - 1) + 1000
+                        logging.info(f"[DEBUG] ========== Comparing INFERENCE snapshots: Task {self._cur_task - 1} vs Task {self._cur_task} (classes {class_group_start}-{class_group_end-1}) ==========")
+                        self.hc_soinn.compare_cluster_snapshots(prev_inference_task_id, inference_task_id, classes_to_log)
+
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
         elif getattr(self, "use_soinn", False):
