@@ -1,5 +1,5 @@
 {
-    "prefix": "class1-10",
+    "prefix": "",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -12,7 +12,7 @@
     "device": ["0"],
     "seed": [0],
     
-    "tuned_epoch": 20,
+    "tuned_epoch": 3,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,
@@ -46,9 +46,8 @@
     "load_all_checkpoints": false,
 
 
-    "use_feature_alignment": false,
-    "alignment_k": 15,
+    "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
-    "test_only_first_task_classes": true
+    "test_only_first_task_classes": false
 }
 

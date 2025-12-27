@@ -131,7 +131,7 @@ class ClusterStructureAnalyzer:
             images_tensor = torch.stack(images_dict[cls])  # [N_cls, C, H, W]
             feats_array = np.array(feats_dict[cls])  # [N_cls, D]
             
-            # Normalize features to work in normalized space (consistent with STAR)
+            # Normalize features to work in normalized space
             feats_array_norm = feats_array / (np.linalg.norm(feats_array, axis=1, keepdims=True) + 1e-8)
             
             self._cluster_samples[cls] = {

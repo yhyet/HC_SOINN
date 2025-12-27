@@ -10,7 +10,6 @@ from utils.inc_net import OurNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 from utils.hc_soinn_classifier import HCSOINNClassifier
-from utils.star_alignment import STARAlignment
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
 import random
 
@@ -92,56 +91,6 @@ class Learner(BaseLearner):
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
 
-        # HC-SOINN 特征漂移对齐配置 (STAR)
-        self.use_feature_alignment = args.get("use_feature_alignment", False)
-        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
-        self.star = None  # STAR 对齐器（延迟初始化）
-
-        # 如果启用特征对齐且使用 HC-SOINN，初始化 STAR
-        if self.use_feature_alignment and self.use_hc_soinn:
-            # 定义特征提取函数（适配 CL-LoRA 的网络结构）
-            # 重要：只使用 general_lora，不包含 specific_lora
-            # 这与 ClusterStructureAnalyzer 的逻辑保持一致
-            def feature_extractor(x):
-                if isinstance(self._network, nn.DataParallel):
-                    backbone = self._network.module.backbone
-                else:
-                    backbone = self._network.backbone
-                
-                # 只使用 general_lora 提取特征（不包含 specific_lora）
-                B = x.shape[0]
-                x = backbone.patch_embed(x)
-                cls_tokens = backbone.cls_token.expand(B, -1, -1)
-                x = torch.cat((cls_tokens, x), dim=1)
-                x = x + backbone.pos_embed
-                x = backbone.pos_drop(x)
-                
-                # 只使用 general_pos 的 adapter（如果 general_pos 为空，则使用原始 backbone）
-                if len(backbone.general_pos) > 0:
-                    for j in backbone.general_pos:
-                        pos = backbone.adapt_pos.index(j)
-                        adapt = backbone.cur_adapter[pos]
-                        x = backbone.blocks[j](x, adapt)
-                else:
-                    # 如果没有 general_pos，则只使用原始 backbone（不使用任何 adapter）
-                    for j in range(len(backbone.blocks)):
-                        x = backbone.blocks[j](x, adapt=None, prompt=None, rank_prompt=None, block_weight=None)
-                
-                x = backbone.norm(x)
-                feats = x[:, 0, :]  # 提取 CLS token
-                return feats
-
-            self.star = STARAlignment(
-                hc_soinn=self.hc_soinn,
-                feature_extractor=feature_extractor,
-                device=self._device,
-                use_full_task_rehearsal=self.use_full_task_rehearsal,
-            )
-            if self.use_full_task_rehearsal:
-                logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
-            else:
-                logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
-            logging.info("注意：STAR 将只使用 general_lora 提取特征（不包含 specific_lora）")
 
         # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
         self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
@@ -189,22 +138,9 @@ class Learner(BaseLearner):
 
     def after_task(self):
         """
-        ========================================================================
-        STAR (Structure-Topology Alignment via Residuals) Pipeline
-        ========================================================================
-        每个 task 结束后的统一处理流程（STAR 特征漂移对齐的核心入口）
+        每个 task 结束后的处理流程
         """
-        # ========== Prepare current task class set ==========
-        # Get the classes that belong to the current task (to exclude from alignment)
-        current_task_classes = set(range(self._known_classes, self._total_classes))
-        
-        # ========== Step 1: 特征漂移对齐（针对旧类别）==========
-        # 目的：将旧类别的 SOINN 节点从旧模型空间对齐到新模型空间
-        # IMPORTANT: Pass current_task_classes to avoid aligning classes that were just saved
-        if self.star is not None:
-            self.star.align_old_classes(self._cur_task, current_task_classes=current_task_classes)
-
-        # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
+        # ========== 压缩 HC-SOINN（生成当前任务的节点）==========
         # 目的：为当前任务的新类别生成 SOINN 原型节点
         if self.use_hc_soinn:
             try:
@@ -214,20 +150,6 @@ class Learner(BaseLearner):
                 self.hc_soinn.compress()
             except Exception as e:
                 logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
-
-        # ========== Step 3: 为当前任务选择锚点（用于下一轮对齐）==========
-        # 目的：为当前任务的每个类别选择 Top-K 锚点，保存用于下一轮漂移对齐
-        if self.star is not None:
-            # 获取当前任务的训练数据集
-            dataset = self.data_manager.get_dataset(
-                np.arange(self._known_classes, self._total_classes),
-                source="train", mode="test"
-            )
-            self.star.select_anchors_for_current_task(
-                dataset=dataset,
-                batch_size=self.batch_size,
-                num_workers=num_workers
-            )
 
         # ========== Step 4: 簇结构分析实验：保存Task 1样本或计算Procrustes距离==========
         if self.cluster_analyzer is not None:

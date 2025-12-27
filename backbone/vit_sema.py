@@ -348,3 +348,4 @@ def vit_base_patch16_224_in21k_sema(pretrained=False, **kwargs):
     model.out_dim = 768
     return model
 
+

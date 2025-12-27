@@ -14,8 +14,8 @@ from utils.toolkit import tensor2numpy
 from utils.knn_classifier import KNNClassifier
 from utils.soinn_classifier import SOINNClassifier
 from utils.hc_soinn_classifier import HCSOINNClassifier
-from utils.star_alignment import STARAlignment
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
+from utils.STAR import STARAligner
 import os
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
@@ -94,11 +94,6 @@ class Learner(BaseLearner):
         total_trainable_params = sum(p.numel() for p in self._network.fc.parameters() if p.requires_grad) + sum(p.numel() for p in self._network.prompt.parameters() if p.requires_grad)
         logging.info(f'{total_trainable_params:,} fc and prompt training parameters.')
         
-        # HC-SOINN 特征漂移对齐配置 (STAR)
-        self.use_feature_alignment = args.get("use_feature_alignment", False)
-        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
-        self.star = None  # STAR 对齐器（延迟初始化）
-        
         # 实验模式：只测试第一个任务的类别（用于分析特征漂移 vs 新类别干扰）
         self.test_only_first_task_classes = args.get("test_only_first_task_classes", False)
         if self.test_only_first_task_classes:
@@ -124,36 +119,26 @@ class Learner(BaseLearner):
                 device=self._device,
                 args=args
             )
+
+        # STAR 特征漂移对齐配置
+        self.use_feature_alignment = args.get("use_feature_alignment", False)
+        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
+        self.star = None  # STAR 对齐器（延迟初始化）
         
         # 如果启用特征对齐且使用 HC-SOINN，初始化 STAR
         if self.use_feature_alignment and self.use_hc_soinn:
             # 定义特征提取函数（适配 CodaPrompt 的网络结构）
             def feature_extractor(x):
-                # DEBUG: Log task_count when extracting features
-                try:
-                    if isinstance(self._network, nn.DataParallel):
-                        task_count = self._network.module.prompt.task_count if self._network.module.prompt is not None else -1
-                        feats = self._network.module(x, pen=True, train=False)
-                    else:
-                        task_count = self._network.prompt.task_count if self._network.prompt is not None else -1
-                        feats = self._network(x, pen=True, train=False)
-                    
-                    # Only log once per batch to avoid spam
-                    if not hasattr(feature_extractor, '_logged_task_count') or feature_extractor._logged_task_count != task_count:
-                        logging.info(f"[STAR DEBUG] Feature extraction using task_count={task_count}")
-                        feature_extractor._logged_task_count = task_count
-                except Exception as e:
-                    logging.warning(f"[STAR DEBUG] Could not log task_count: {e}")
-                    if isinstance(self._network, nn.DataParallel):
-                        feats = self._network.module(x, pen=True, train=False)
-                    else:
-                        feats = self._network(x, pen=True, train=False)
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module(x, pen=True, train=False)
+                else:
+                    feats = self._network(x, pen=True, train=False)
                 
                 if isinstance(feats, tuple):
                     feats = feats[0]
                 return feats
             
-            self.star = STARAlignment(
+            self.star = STARAligner(
                 hc_soinn=self.hc_soinn,
                 feature_extractor=feature_extractor,
                 device=self._device,
@@ -163,7 +148,7 @@ class Learner(BaseLearner):
                 logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
             else:
                 logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
-
+        
         # NCM分类器：初始化类均值存储
         self._class_means = None
         # feature_dim 是 BaseLearner 的 @property，会从 self._network.feature_dim 获取
@@ -171,10 +156,7 @@ class Learner(BaseLearner):
 
     def after_task(self):
         """
-        ========================================================================
-        STAR (Structure-Topology Alignment via Residuals) Pipeline
-        ========================================================================
-        每个 task 结束后的统一处理流程（STAR 特征漂移对齐的核心入口）：
+        每个 task 结束后的处理流程（STAR 特征漂移对齐的核心入口）
         
         【Pipeline 流程说明】
         ┌─────────────────────────────────────────────────────────────────┐
@@ -183,9 +165,9 @@ class Learner(BaseLearner):
                               ↓
         ┌─────────────────────────────────────────────────────────────────┐
         │ Step 1: 漂移对齐 (Drift Alignment)                              │
-        │   - 对旧类别 (C_0, ..., C_{t-1}) 的 SOINN 节点进行相似变换校正  │
-        │   - 使用保存的锚点计算 Procrustes 变换 (R, s, t)                │
-        │   - 将旧节点从 f_{t-1} 空间对齐到 f_t 空间                      │
+        │   - 对旧类别 (C_0, ..., C_{t-1}) 的 SOINN 节点进行刚性变换校正  │
+        │   - 使用保存的锚点计算 Procrustes 变换 (R, mu_old, mu_new)      │
+        │   - 将旧节点从 f_{t-1} 空间对齐到 f_t 空间（Plan B：从原始节点） │
         └─────────────────────────────────────────────────────────────────┘
                               ↓
         ┌─────────────────────────────────────────────────────────────────┐
@@ -196,48 +178,25 @@ class Learner(BaseLearner):
                               ↓
         ┌─────────────────────────────────────────────────────────────────┐
         │ Step 3: 锚点选择 (Anchor Selection)                              │
-        │   - 为当前任务 (C_t) 的每个类别选择 Top-K 锚点                  │
-        │   - 基于 SOINN 拓扑骨架（重要性最高的节点）选择最近邻样本        │
+        │   - 为当前任务 (C_t) 的每个类别选择锚点（全量拓扑映射）          │
+        │   - 基于 SOINN 节点和 NCM 中心选择最近邻样本                     │
         │   - 保存锚点图片和特征，用于下一轮 (Task t+1) 的漂移对齐        │
         └─────────────────────────────────────────────────────────────────┘
         
         【关键设计】
         - 顺序很重要：必须先对齐旧类，再压缩新类，最后选锚点
-        - 锚点只保存当前任务的，旧任务的锚点在上一轮已经更新过特征
-        - 对齐操作会同时更新 SOINN 节点和 NCM 类中心
+        - Plan B：对齐操作始终从 class_clusters_original 开始，避免累积误差
+        - 链式覆盖：对齐后更新参考特征，确保对齐链的连续性
         """
         # ========== Prepare current task class set ==========
         # Get the classes that belong to the current task (to exclude from alignment)
         current_task_classes = set(range(self._known_classes, self._total_classes))
         
-        # ========== DEBUG: Save snapshot BEFORE alignment ==========
-        # Purpose: Track how SOINN nodes change due to STAR alignment
-        # 只在对应任务记录一次：class 0-9 在 Task 2 记录，class 10-19 在 Task 3 记录，以此类推
-        if self.use_hc_soinn and self._cur_task >= 2:
-            # 计算当前任务应该记录的类组：Task 2 记录 class 0-9, Task 3 记录 class 10-19, ...
-            class_group_start = (self._cur_task - 2) * 10
-            class_group_end = class_group_start + 10
-            
-            # 确保不超过总类别数
-            if class_group_start < self._total_classes:
-                class_group_end = min(class_group_end, self._total_classes)
-                classes_to_log = list(range(class_group_start, class_group_end))
-                
-                self.hc_soinn.save_cluster_snapshot(self._cur_task, classes_to_log)
-                logging.info(f"[DEBUG] Saved snapshot for Task {self._cur_task} (before alignment, classes {class_group_start}-{class_group_end-1})")
-                
-                # 只在首次记录时比较（Task 2 比较 Task 1 vs Task 2，Task 3 比较 Task 2 vs Task 3，...）
-                if self._cur_task >= 2:
-                    logging.info(f"[DEBUG] ========== Comparing snapshots: Task {self._cur_task - 1} vs Task {self._cur_task} (classes {class_group_start}-{class_group_end-1}) ==========")
-                    self.hc_soinn.compare_cluster_snapshots(self._cur_task - 1, self._cur_task, classes_to_log)
-        
         # ========== Step 1: 特征漂移对齐（针对旧类别）==========
-        # 目的：将旧类别的 SOINN 节点从旧模型空间对齐到新模型空间
-        # 使用 STAR 模块进行对齐
-        # IMPORTANT: Pass current_task_classes to avoid aligning classes that were just saved
-        if self.star is not None:
-            self.star.align_old_classes(self._cur_task, current_task_classes=current_task_classes)
-
+        # 注意：对齐已在 _build_classifiers() 中提前执行（在评估前）
+        # 这里不再重复对齐，只处理新类别的压缩和锚点选择
+        # 对齐时机修复：在评估前对齐，确保评估时使用的是对齐后的节点
+        
         # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
         # 目的：为当前任务的新类别生成 SOINN 原型节点
         # 输入：self.hc_soinn.buffers (当前任务的训练特征)
@@ -247,10 +206,10 @@ class Learner(BaseLearner):
                 self.hc_soinn.compress()
             except Exception as e:
                 logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
-                
+        
         # ========== Step 3: 为当前任务选择锚点（用于下一轮对齐）==========
-        # 目的：为当前任务的每个类别选择 Top-K 锚点，保存用于下一轮漂移对齐
-        # 使用 STAR 模块进行锚点选择
+        # 目的：为当前任务的每个类别选择锚点，保存用于下一轮漂移对齐
+        # 使用 STAR 模块进行锚点选择（全量拓扑映射）
         if self.star is not None:
             # 获取当前任务的训练数据集
             dataset = self.data_manager.get_dataset(
@@ -260,7 +219,8 @@ class Learner(BaseLearner):
             self.star.select_anchors_for_current_task(
                 dataset=dataset,
                 batch_size=self.batch_size,
-                num_workers=num_workers
+                num_workers=num_workers,
+                current_task_classes=current_task_classes
             )
 
         # 4. 基于使用频率的渐进式剪枝（只剪当前 task 的类别，可通过开关控制）
@@ -416,6 +376,21 @@ class Learner(BaseLearner):
         # 确保模型在正确的设备上并处于eval模式
         self._network.to(self._device)
         self._network.eval()
+        
+        # ========== Step 0: STAR 特征漂移对齐（在评估前对齐旧类别）==========
+        # 关键修复：在评估之前对齐旧类别，确保评估时使用的是对齐后的节点
+        # 这解决了性能断崖式下跌的问题（Task 2 评估时使用的是未对齐的节点）
+        if self.star is not None and self._cur_task > 0:
+            # 准备当前任务的类别集合（用于排除）
+            current_task_classes = set(range(self._known_classes, self._total_classes))
+            logging.info(
+                f"[STAR] Pre-evaluation alignment: Aligning old classes before evaluation "
+                f"(task {self._cur_task}, current task classes: {current_task_classes})"
+            )
+            self.star.align_old_classes(
+                cur_task=self._cur_task,
+                current_task_classes=current_task_classes
+            )
         
         # 1. 构建NCM分类器：计算所有已见过的任务的类均值
         self._build_ncm_classifier()
