@@ -101,37 +101,36 @@ class Learner(BaseLearner):
 
         if self.analyze_cluster_structure_drift:
             logging.info("簇结构分析实验启用：将计算Procrustes距离验证特征漂移时簇结构是否改变")
-            logging.info("注意：CL-LoRA 将只使用 general_lora 提取特征（不包含 specific_lora）")
+            logging.info("注意：CL-LoRA 将使用与推理阶段相同的特征提取方式（forward_test逻辑）")
             # 定义特征提取函数（适配 CL-LoRA 的网络结构）
-            # 重要：只使用 general_lora，不包含 specific_lora
+            # 重要：使用与推理阶段相同的特征提取方式
+            # 
+            # 在CL-LoRA的forward_test中，对于Task 1的类别（使用adapter_list[0]）：
+            # - general_pos: 使用cur_adapter（当前任务的general_lora，会更新）
+            # - specific_pos: 使用adapter_list[0]（Task 1的specific_lora，保持不变）
+            # 
+            # 这与推理阶段的特征提取方式完全一致，确保Procrustes距离分析的准确性
             def feature_extractor(x):
                 if isinstance(self._network, nn.DataParallel):
                     backbone = self._network.module.backbone
                 else:
                     backbone = self._network.backbone
                 
-                # 只使用 general_lora 提取特征（不包含 specific_lora）
-                B = x.shape[0]
-                x = backbone.patch_embed(x)
-                cls_tokens = backbone.cls_token.expand(B, -1, -1)
-                x = torch.cat((cls_tokens, x), dim=1)
-                x = x + backbone.pos_embed
-                x = backbone.pos_drop(x)
+                # 使用forward_test提取特征，与推理阶段保持一致
+                # forward_test返回所有adapter的concat特征列表
+                features_list = backbone.forward_test(x, use_init_ptm=self.use_init_ptm)
                 
-                # 只使用 general_pos 的 adapter（如果 general_pos 为空，则使用原始 backbone）
-                if len(backbone.general_pos) > 0:
-                    for j in backbone.general_pos:
-                        pos = backbone.adapt_pos.index(j)
-                        adapt = backbone.cur_adapter[pos]
-                        x = backbone.blocks[j](x, adapt)
+                # 对于Task 1的类别，使用adapter_list[0]的特征（第一个adapter）
+                # features_list的顺序：[init_ptm(if enabled), adapter_list[0], adapter_list[1], ..., cur_adapter]
+                # 对于Task 1，我们使用adapter_list[0]的特征
+                if self.use_init_ptm:
+                    # 如果有init_ptm，adapter_list[0]是第二个特征
+                    task1_feat = features_list[1][:, 0, :]  # [B, 768]
                 else:
-                    # 如果没有 general_pos，则只使用原始 backbone（不使用任何 adapter）
-                    for j in range(len(backbone.blocks)):
-                        x = backbone.blocks[j](x, adapt=None, prompt=None, rank_prompt=None, block_weight=None)
+                    # 如果没有init_ptm，adapter_list[0]是第一个特征
+                    task1_feat = features_list[0][:, 0, :]  # [B, 768]
                 
-                x = backbone.norm(x)
-                feats = x[:, 0, :]  # 提取 CLS token
-                return feats
+                return task1_feat
 
             self.cluster_analyzer = ClusterStructureAnalyzer(
                 feature_extractor=feature_extractor,
