@@ -1,5 +1,5 @@
 {
-    "prefix": "ncm",
+    "prefix": "no_star",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -48,6 +48,6 @@
     "hcsoinn_soinn_max_degree_for_removal": 1,
     
     "analyze_cluster_structure_drift": true,
-    "use_feature_alignment": true
+    "use_feature_alignment": false
 }
 
