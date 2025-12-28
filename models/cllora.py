@@ -90,6 +90,9 @@ class Learner(BaseLearner):
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
+        
+        # NCM分类器：初始化类均值存储
+        self._class_means = None
 
 
         # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
@@ -354,7 +357,10 @@ class Learner(BaseLearner):
         self._network.add_fc()
         self.replace_fc(self.train_loader_for_protonet)
 
-        # 训练结束后，构建 HC-SOINN bank（如果启用）
+        # 训练结束后，构建分类器（NCM、HC-SOINN等）
+        self._build_ncm_classifier()
+        
+        # 构建 HC-SOINN bank（如果启用）
         if self.use_hc_soinn:
             self._build_hc_soinn_bank()
 
@@ -805,6 +811,228 @@ class Learner(BaseLearner):
 
         return np.concatenate(y_pred), np.concatenate(y_true)
 
+    def _build_ncm_classifier(self):
+        """
+        构建NCM分类器：计算类均值（CL-LoRA diagonal NCM逻辑）
+        
+        对于CL-LoRA的diagonal NCM：
+        - 每个类别只属于一个adapter
+        - Adapter 0: 类别 0-init_cls-1
+        - Adapter 1: 类别 init_cls-init_cls+inc-1
+        - ...
+        - 对于每个类别，只计算它在"属于它的adapter"上的类均值
+        """
+        model = self._network
+        model.eval()
+        
+        # 判断是否需要重建所有类均值（首次任务或加载checkpoint后）
+        need_rebuild_all = (self._class_means is None) or (self._class_means.shape[0] == 0)
+        
+        if need_rebuild_all:
+            # 首次任务或加载checkpoint后：需要计算所有已见过的任务的类均值
+            logging.info(f"Building NCM classifier: computing all seen classes (0-{self._total_classes-1}) [first task or after checkpoint load]")
+            
+            # 初始化类均值数组 [num_classes, out_dim]
+            self._class_means = np.zeros((self._total_classes, self._network.out_dim))
+            
+            # 提取所有训练样本的特征（按类别和adapter分组）
+            with torch.no_grad():
+                for class_idx in range(self._total_classes):
+                    # 确定当前类别属于哪个adapter
+                    if class_idx < self.init_cls:
+                        adapter_idx = 0
+                    else:
+                        adapter_idx = ((class_idx - self.init_cls) // self.inc) + 1
+                    
+                    # 获取当前类别的训练数据
+                    class_dataset = self.data_manager.get_dataset(
+                        np.array([class_idx]), source="train", mode="test"
+                    )
+                    class_loader = DataLoader(
+                        class_dataset,
+                        batch_size=self.batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        num_workers=num_workers
+                    )
+                    
+                    # 提取特征（使用对应adapter）
+                    embedding_list = []
+                    for _, (_, inputs, targets) in enumerate(class_loader):
+                        inputs = inputs.to(self._device)
+                        # 使用forward_proto提取对应adapter的特征
+                        if self.use_init_ptm:
+                            if adapter_idx == 0:
+                                adapt_index = -1  # 使用init PTM
+                            else:
+                                adapt_index = adapter_idx - 1
+                        else:
+                            adapt_index = adapter_idx
+                        
+                        embeddings = model.backbone.forward_proto(inputs, adapt_index=adapt_index)
+                        embedding_list.append(embeddings.cpu())
+                    
+                    if len(embedding_list) > 0:
+                        embedding_list = torch.cat(embedding_list, dim=0)
+                        proto = embedding_list.mean(0)
+                        self._class_means[class_idx, :] = proto.numpy()
+            
+            logging.info(f"NCM classifier built: computed class means for {self._total_classes} classes")
+        else:
+            # 正常训练：累积存储机制 - 保留之前的类均值，只计算当前任务新类别的类均值
+            logging.info(f"Building NCM classifier: preserving previous class means, computing new classes ({self._known_classes}-{self._total_classes-1})")
+            
+            # 扩展类均值数组以容纳新类别，保留之前的类均值
+            if self._class_means.shape[0] < self._total_classes:
+                new_class_means = np.zeros((self._total_classes, self._network.out_dim))
+                new_class_means[:self._class_means.shape[0]] = self._class_means
+                self._class_means = new_class_means
+                logging.info(f"Extended NCM classifier: preserved {self._class_means.shape[0] - (self._total_classes - self._known_classes)} previous class means")
+            
+            # 提取当前任务训练样本的特征（按类别和adapter分组）
+            with torch.no_grad():
+                # 只计算新类别的类均值
+                for class_idx in range(self._known_classes, self._total_classes):
+                    # 确定当前类别属于哪个adapter
+                    if class_idx < self.init_cls:
+                        adapter_idx = 0
+                    else:
+                        adapter_idx = ((class_idx - self.init_cls) // self.inc) + 1
+                    
+                    # 获取当前类别的训练数据
+                    class_dataset = self.data_manager.get_dataset(
+                        np.array([class_idx]), source="train", mode="test"
+                    )
+                    class_loader = DataLoader(
+                        class_dataset,
+                        batch_size=self.batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        num_workers=num_workers
+                    )
+                    
+                    # 提取特征（使用对应adapter）
+                    embedding_list = []
+                    for _, (_, inputs, targets) in enumerate(class_loader):
+                        inputs = inputs.to(self._device)
+                        # 使用forward_proto提取对应adapter的特征
+                        if self.use_init_ptm:
+                            if adapter_idx == 0:
+                                adapt_index = -1  # 使用init PTM
+                            else:
+                                adapt_index = adapter_idx - 1
+                        else:
+                            adapt_index = adapter_idx
+                        
+                        embeddings = model.backbone.forward_proto(inputs, adapt_index=adapt_index)
+                        embedding_list.append(embeddings.cpu())
+                    
+                    if len(embedding_list) > 0:
+                        embedding_list = torch.cat(embedding_list, dim=0)
+                        proto = embedding_list.mean(0)
+                        self._class_means[int(class_idx), :] = proto.numpy()
+            
+            logging.info(f"NCM classifier updated: computed class means for classes {self._known_classes}-{self._total_classes-1} (total: {self._total_classes} classes)")
+
+    def _eval_ncm(self, loader):
+        """
+        使用NCM分类器进行评估（CL-LoRA diagonal NCM逻辑）
+        
+        对于CL-LoRA的diagonal NCM：
+        - 每个类别只使用"属于它的adapter"的特征和类均值
+        - 按adapter分段计算NCM相似度，然后合并logits
+        """
+        self._network.eval()
+        y_pred, y_true = [], []
+        out_dim = self._network.out_dim
+        num_adapters = self._cur_task + 1
+        
+        if self._class_means is None or self._class_means.shape[0] == 0:
+            logging.warning("NCM classifier not built, returning zero predictions")
+            for _, (_, inputs, targets) in enumerate(loader):
+                batch_size = inputs.shape[0]
+                topk_pred = np.zeros((batch_size, self.topk), dtype=np.int64)
+                y_pred.append(topk_pred)
+                y_true.append(targets.cpu().numpy())
+            return np.concatenate(y_pred), np.concatenate(y_true)
+        
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                batch_size = inputs.shape[0]
+                
+                # CL-LoRA diagonal NCM：按adapter分段计算logits，然后合并
+                all_logits = []
+                
+                for adapter_idx in range(num_adapters):
+                    # 提取当前adapter的特征
+                    if self.use_init_ptm:
+                        if adapter_idx == 0:
+                            adapt_index = -1  # 使用init PTM
+                        else:
+                            adapt_index = adapter_idx - 1
+                    else:
+                        adapt_index = adapter_idx
+                    
+                    adapter_feats = self._network.backbone.forward_proto(inputs, adapt_index=adapt_index)  # [B, out_dim]
+                    
+                    # 确定当前adapter对应的类别范围
+                    if adapter_idx == 0:
+                        start_cls = 0
+                        end_cls = self.init_cls
+                    else:
+                        start_cls = self.init_cls + (adapter_idx - 1) * self.inc
+                        end_cls = start_cls + self.inc
+                    
+                    # 构建当前adapter的NCM中心
+                    ncm_centers = []
+                    valid_classes = []
+                    for cls in range(start_cls, min(end_cls, self._total_classes)):
+                        if cls < self._class_means.shape[0] and np.any(self._class_means[cls] != 0):
+                            ncm_centers.append(self._class_means[cls])
+                            valid_classes.append(cls)
+                    
+                    if len(ncm_centers) == 0:
+                        # 如果没有有效的原型，创建零logits
+                        adapter_logits = torch.zeros((batch_size, end_cls - start_cls), device=self._device)
+                    else:
+                        # 计算NCM相似度
+                        ncm_centers_t = torch.from_numpy(np.stack(ncm_centers)).float().to(self._device)  # [C, out_dim]
+                        
+                        # 归一化
+                        adapter_feats_norm = torch.nn.functional.normalize(adapter_feats, p=2, dim=1)
+                        ncm_centers_norm = torch.nn.functional.normalize(ncm_centers_t, p=2, dim=1)
+                        
+                        # 计算相似度 [B, out_dim] @ [out_dim, C] -> [B, C]
+                        sim_ncm = torch.mm(adapter_feats_norm, ncm_centers_norm.t())  # [B, C]
+                        
+                        # 转换为距离（用于topk预测，距离越小越好）
+                        dist_ncm = 1.0 - sim_ncm  # [B, C]
+                        
+                        # 构建完整的logits（包含所有start_cls到end_cls的类别）
+                        adapter_logits = torch.full((batch_size, end_cls - start_cls), float('inf'), device=self._device)
+                        for i, cls in enumerate(valid_classes):
+                            if start_cls <= cls < end_cls:
+                                adapter_logits[:, cls - start_cls] = dist_ncm[:, i]
+                    
+                    all_logits.append(adapter_logits)
+                
+                # 合并所有adapter的logits
+                combined_logits = torch.cat(all_logits, dim=1)  # [B, total_classes]
+                
+                # 获取topk预测（距离越小越好）
+                _, topk_indices = torch.topk(combined_logits, k=self.topk, dim=1, largest=False)
+                topk_pred = topk_indices.cpu().numpy()
+                
+                y_pred.append(topk_pred)
+                y_true.append(targets.cpu().numpy())
+        
+        if len(y_pred) == 0:
+            logging.warning("No predictions generated from NCM evaluation")
+            return np.array([]), np.array([])
+        
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
     def eval_task(self):
         """
         评估任务：使用FC分类器进行评估，如果启用HC-SOINN则同时评估
@@ -816,7 +1044,12 @@ class Learner(BaseLearner):
         y_pred, y_true = self._eval_cnn(self.test_loader)
         results["fc"] = self._evaluate(y_pred, y_true)
         
-        # 2. 使用 HC-SOINN 分类器评估（如果启用）
+        # 2. 使用NCM分类器评估（如果已计算类均值）
+        if hasattr(self, "_class_means") and self._class_means is not None:
+            y_pred_ncm, y_true_ncm = self._eval_ncm(self.test_loader)
+            results["ncm"] = self._evaluate(y_pred_ncm, y_true_ncm)
+        
+        # 3. 使用 HC-SOINN 分类器评估（如果启用）
         if getattr(self, "use_hc_soinn", False):
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
