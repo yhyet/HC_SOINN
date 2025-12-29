@@ -55,7 +55,6 @@
     "hcsoinn_soinn_max_iter": 1,
 
     "use_feature_alignment": true,
-    "alignment_k": 15,
     "use_full_task_rehearsal": false,
 
     "analyze_cluster_structure_drift": true
