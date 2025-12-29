@@ -826,11 +826,23 @@ class MultiBranchCosineIncrementalNet(BaseNet):
 
         self.backbones = nn.ModuleList()
         self.args=args
+        self._feature_dim = None  # 将在construct_dual_branch_network中设置
         
         if 'resnet' in args['backbone_type']:
             self.model_type='cnn'
         else:
             self.model_type='vit'
+
+    @property
+    def feature_dim(self):
+        """返回特征维度，用于BaseLearner"""
+        if self._feature_dim is not None:
+            return self._feature_dim
+        # 如果还没有构建dual branch，返回默认值
+        if len(self.backbones) > 0:
+            return self.backbones[0].out_dim * len(self.backbones)
+        # 如果没有backbones，返回基类的feature_dim（虽然backbone是Identity，但这是fallback）
+        return super().feature_dim
 
     def update_fc(self, nb_classes, nextperiod_initialization=None):
         fc = self.generate_fc(self._feature_dim, nb_classes).to(self._device)
@@ -863,6 +875,14 @@ class MultiBranchCosineIncrementalNet(BaseNet):
         out.update({"features": features})
         return out
 
+    def extract_vector(self, x):
+        """提取特征向量，用于HC-SOINN等分类器"""
+        if self.model_type == 'cnn':
+            features = [backbone(x)["features"] for backbone in self.backbones]
+        else:
+            features = [backbone(x) for backbone in self.backbones]
+        features = torch.cat(features, 1)
+        return features
     
     def construct_dual_branch_network(self, tuned_model):
         if 'ssf' in self.args['backbone_type']:
