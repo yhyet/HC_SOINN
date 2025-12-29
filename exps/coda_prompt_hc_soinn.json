@@ -46,8 +46,10 @@
     "load_all_checkpoints": false,
 
 
-    "use_feature_alignment": true,
+    "use_feature_alignment": false,
     "use_full_task_rehearsal": false,
-    "test_only_first_task_classes": false
+    "test_only_first_task_classes": false,
+
+    "analyze_cluster_structure_drift": true
 }
 

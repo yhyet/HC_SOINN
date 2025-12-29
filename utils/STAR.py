@@ -498,16 +498,31 @@ class STARAligner:
             R = np.dot(U, Vt)
         
         # 4. 计算缩放因子 s
-        # s = tr(S) / tr(X^T @ X)  (对于正交 Procrustes with Scaling)
         var_old = np.sum(np.square(X))
         trace_S = np.sum(S)
-        
         if var_old < 1e-8:
             s = 1.0
         else:
             s = trace_S / var_old
             
-        logging.debug(f"[STAR] Computed transform: Scale={s:.4f}")
+        # ================= [新增 Debug 信息] =================
+        # 计算旧中心和新中心的欧氏距离
+        shift_dist = np.linalg.norm(mu_new - mu_old)
+        # 计算特征的平均模长 (用于归一化漂移量)
+        avg_norm = np.mean(np.linalg.norm(feats_old, axis=1))
+        # 计算旋转角度 (弧度)
+        trace_R = np.trace(R)
+        theta = np.arccos(np.clip((trace_R - (feats_old.shape[1] - 2)) / 2, -1, 1)) # 简化的估算
+
+        logging.info(f"[STAR DEBUG] Drift Analysis:")
+        logging.info(f"  > Shift (Mean Move): {shift_dist:.6f} (Avg Norm: {avg_norm:.2f})")
+        logging.info(f"  > Scale Change: {s:.6f}")
+        logging.info(f"  > Rotation Angle: {theta:.6f}")
+        
+        # 如果漂移非常小，STAR 就不会有效果
+        if shift_dist < 0.1 and abs(s - 1.0) < 0.01:
+             logging.warning("[STAR WARNING] Feature drift is NEGLIGIBLE! STAR will have no effect.")
+        # ====================================================
         
         return R, mu_old, mu_new, s
     

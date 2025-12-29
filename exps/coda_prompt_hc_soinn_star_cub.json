@@ -49,6 +49,8 @@
     "checkpoint_name": "coda_prompt_hc_soinn_star_cub",
     "load_all_checkpoints": false,
 
-    "test_only_first_task_classes": false
+    "test_only_first_task_classes": false,
+
+    "analyze_cluster_structure_drift": true
 }
 
