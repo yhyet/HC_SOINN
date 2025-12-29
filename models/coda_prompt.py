@@ -197,17 +197,8 @@ class Learner(BaseLearner):
         # 这里不再重复对齐，只处理新类别的压缩和锚点选择
         # 对齐时机修复：在评估前对齐，确保评估时使用的是对齐后的节点
         
-        # ========== Step 2: 压缩 HC-SOINN（生成当前任务的节点）==========
-        # 目的：为当前任务的新类别生成 SOINN 原型节点
-        # 输入：self.hc_soinn.buffers (当前任务的训练特征)
-        # 输出：更新 self.hc_soinn.class_clusters (新增当前任务的节点)
-        if self.use_hc_soinn:
-            try:
-                self.hc_soinn.compress()
-            except Exception as e:
-                logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
-        
-        # ========== Step 3: 为当前任务选择锚点（用于下一轮对齐）==========
+        # ========== Step 2: 为当前任务选择锚点（用于下一轮对齐）==========
+        # 注意：HC-SOINN压缩已在_build_hc_soinn_bank中完成，这里不再重复压缩
         # 目的：为当前任务的每个类别选择锚点，保存用于下一轮漂移对齐
         # 使用 STAR 模块进行锚点选择（全量拓扑映射）
         if self.star is not None:

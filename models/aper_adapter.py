@@ -10,6 +10,9 @@ from torch.utils.data import DataLoader
 from utils.inc_net import IncrementalNet,SimpleCosineIncrementalNet,MultiBranchCosineIncrementalNet,SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import target2onehot, tensor2numpy
+from utils.hc_soinn_classifier import HCSOINNClassifier
+from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
+from utils.STAR import STARAligner
 
 # tune the model at first session with adapter, and then conduct simplecil.
 num_workers = 8
@@ -32,8 +35,121 @@ class Learner(BaseLearner):
         self.weight_decay=args["weight_decay"] if args["weight_decay"] is not None else 0.0005
         self.min_lr=args['min_lr'] if args['min_lr'] is not None else 1e-8
         self.args=args
+        
+        # HC-SOINN plugin
+        self.use_hc_soinn = args.get("use_hc_soinn", False)
+        if self.use_hc_soinn:
+            logging.info("Initializing HC-SOINNClassifier")
+            self.hc_soinn = HCSOINNClassifier(
+                max_prototypes_per_class=args.get("hcsoinn_max_proto_per_class", 20),
+                alpha=args.get("hcsoinn_alpha", 0.5),
+                tau_merge=args.get("hcsoinn_tau_merge", 0.2),
+                tau_reject=args.get("hcsoinn_tau_reject", 2.0),
+                linkage_method=args.get("hcsoinn_linkage", "average"),
+                distance_metric=args.get("hcsoinn_distance", "cosine"),
+                use_soinn_refinement=args.get("hcsoinn_use_soinn_refinement", True),
+                soinn_ad=args.get("hcsoinn_soinn_ad", 20),
+                soinn_lam=args.get("hcsoinn_soinn_lam", 20),
+                soinn_threshold_scale=args.get("hcsoinn_soinn_threshold_scale", 0.5),
+                soinn_max_iter=args.get("hcsoinn_max_iter", 3),
+                soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
+            )
+        
+        # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
+        self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
+        self.cluster_analyzer = None  # 簇结构分析器（延迟初始化）
+        
+        if self.analyze_cluster_structure_drift:
+            logging.info("簇结构分析实验启用：将计算Procrustes距离验证特征漂移时簇结构是否改变")
+            # 定义特征提取函数（适配 SimpleVitNet 的网络结构）
+            def feature_extractor(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module.extract_vector(x)
+                else:
+                    feats = self._network.extract_vector(x)
+                return feats
+            
+            self.cluster_analyzer = ClusterStructureAnalyzer(
+                feature_extractor=feature_extractor,
+                device=self._device,
+                args=args
+            )
+
+        # STAR 特征漂移对齐配置
+        self.use_feature_alignment = args.get("use_feature_alignment", False)
+        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
+        self.star = None  # STAR 对齐器（延迟初始化）
+        
+        # 如果启用特征对齐且使用 HC-SOINN，初始化 STAR
+        if self.use_feature_alignment and self.use_hc_soinn:
+            # 定义特征提取函数（适配 SimpleVitNet 的网络结构）
+            def feature_extractor(x):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module.extract_vector(x)
+                else:
+                    feats = self._network.extract_vector(x)
+                return feats
+            
+            self.star = STARAligner(
+                hc_soinn=self.hc_soinn,
+                feature_extractor=feature_extractor,
+                device=self._device,
+                use_full_task_rehearsal=self.use_full_task_rehearsal,
+            )
+            if self.use_full_task_rehearsal:
+                logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
+            else:
+                logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
+        
+        # NCM分类器：初始化类均值存储
+        self._class_means = None
 
     def after_task(self):
+        """
+        每个 task 结束后的处理流程（STAR 特征漂移对齐的核心入口）
+        
+        【Pipeline 流程说明】
+        1. 压缩 HC-SOINN（生成当前任务的节点）
+        2. 为当前任务选择锚点（用于下一轮对齐）
+        3. 簇结构分析实验：保存Task 1样本或计算Procrustes距离
+        4. 更新已知类别数
+        """
+        # ========== Prepare current task class set ==========
+        current_task_classes = set(range(self._known_classes, self._total_classes))
+        
+        # ========== Step 1: 为当前任务选择锚点（用于下一轮对齐）==========
+        # 注意：HC-SOINN压缩已在_build_hc_soinn_bank中完成，这里不再重复压缩
+        if self.star is not None:
+            # 获取当前任务的训练数据集
+            dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train", mode="test"
+            )
+            self.star.select_anchors_for_current_task(
+                dataset=dataset,
+                batch_size=self.batch_size,
+                num_workers=num_workers,
+                current_task_classes=current_task_classes
+            )
+
+        # ========== Step 3: 簇结构分析实验：保存Task 1样本或计算Procrustes距离==========
+        if self.cluster_analyzer is not None:
+            if self._cur_task == 0:
+                # Task 1结束后：保存所有训练样本
+                init_cls = self.args.get("init_cls", 10)
+                dataset_loader = lambda: self.data_manager.get_dataset(
+                    np.arange(0, init_cls), source="train", mode="test"
+                )
+                self.cluster_analyzer.save_task1_samples(
+                    dataset_loader=dataset_loader,
+                    batch_size=self.batch_size,
+                    num_workers=num_workers
+                )
+            else:
+                # 后续任务：计算Procrustes距离
+                self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
+        
+        # ========== Step 4: 更新已知类别数 ==========
         self._known_classes = self._total_classes
     
     def replace_fc(self,trainloader, model, args):
@@ -88,6 +204,9 @@ class Learner(BaseLearner):
         self._train(self.train_loader, self.test_loader, self.train_loader_for_protonet)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
+        
+        # 训练结束后，统一构建所有分类器（HC-SOINN等）
+        self._build_classifiers()
 
     def _train(self, train_loader, test_loader, train_loader_for_protonet):
         
@@ -156,6 +275,168 @@ class Learner(BaseLearner):
             prog_bar.set_description(info)
 
         logging.info(info)
+
+    def _get_hc_soinn_feature_fn(self):
+        """
+        获取HC-SOINN特征提取函数（统一特征提取逻辑）
+        """
+        def feature_fn(x):
+            if isinstance(self._network, nn.DataParallel):
+                feats = self._network.module.extract_vector(x)
+            else:
+                feats = self._network.extract_vector(x)
+            
+            if not isinstance(feats, torch.Tensor):
+                raise TypeError(f"Expected tensor, got {type(feats)}")
+            
+            if len(feats.shape) == 1:
+                feats = feats.reshape(1, -1)
+            elif len(feats.shape) != 2:
+                raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+            
+            return feats
+        
+        return feature_fn
+
+    def _build_classifiers(self):
+        """
+        统一构建所有分类器（在训练结束后、测试开始前调用）
+        包括：HC-SOINN bank
+        无论是正常训练还是加载checkpoint，都在这里统一构建
+        """
+        logging.info(f"Building classifiers for task {self._cur_task} (total classes: {self._total_classes})")
+        
+        # 确保模型在正确的设备上并处于eval模式
+        self._network.to(self._device)
+        self._network.eval()
+        
+        # ========== Step 0: STAR 特征漂移对齐（在评估前对齐旧类别）==========
+        # 关键修复：在评估之前对齐旧类别，确保评估时使用的是对齐后的节点
+        if self.star is not None and self._cur_task > 0:
+            # 准备当前任务的类别集合（用于排除）
+            current_task_classes = set(range(self._known_classes, self._total_classes))
+            logging.info(
+                f"[STAR] Pre-evaluation alignment: Aligning old classes before evaluation "
+                f"(task {self._cur_task}, current task classes: {current_task_classes})"
+            )
+            self.star.align_old_classes(
+                cur_task=self._cur_task,
+                current_task_classes=current_task_classes
+            )
+        
+        # ========== Step 1: 构建 HC-SOINN bank ==========
+        if getattr(self, "use_hc_soinn", False):
+            self._build_hc_soinn_bank()
+        
+        logging.info("All classifiers built successfully")
+    
+    def _build_hc_soinn_bank(self):
+        """
+        构建 HC-SOINN bank：类增量学习场景下的累积存储
+        - 每个任务只使用当前任务的新类别训练数据（符合类增量学习设定）
+        - 旧类别的信息通过已保存的簇中心保留（在 compress 时合并）
+        """
+        hc_bank_empty = (not hasattr(self, "hc_soinn")) or (len(getattr(self.hc_soinn, "class_clusters", {})) == 0)
+        if hc_bank_empty:
+            logging.info(f"HC-SOINN bank is empty!!!")
+        feature_fn = self._get_hc_soinn_feature_fn()
+
+        def add_from_loader(loader):
+            feats, lbs = [], []
+            with torch.no_grad():
+                for _, inputs, targets in loader:
+                    inputs = inputs.to(self._device)
+                    batch_feats = feature_fn(inputs)
+                    if isinstance(batch_feats, torch.Tensor):
+                        batch_feats = batch_feats.detach().cpu().numpy()
+                    lbs.append(targets.numpy())
+                    feats.append(batch_feats)
+            if len(feats) == 0:
+                return
+            feats_np = np.concatenate(feats, axis=0)
+            lbs_np = np.concatenate(lbs, axis=0)
+            self.hc_soinn.add_features(feats_np, lbs_np)
+
+        # 类增量学习：每个任务只使用当前任务的新类别训练数据
+        logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
+        current_task_dataset = self.data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes), source="train", mode="test"
+        )
+        current_task_loader = DataLoader(
+            current_task_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+        )
+        add_from_loader(current_task_loader)
+
+        # 每个任务结束后压缩一次
+        try:
+            self.hc_soinn.compress()
+        except Exception as e:
+            logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
+
+    def _eval_hc_soinn(self, loader):
+        """使用 HC-SOINN 分类器进行评估"""
+        self._network.eval()
+        y_pred, y_true = [], []
+        feature_fn = self._get_hc_soinn_feature_fn()
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                feats = feature_fn(inputs)
+                feats = feats.detach().cpu()
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                elif len(feats.shape) != 2:
+                    raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
+                feats_np = feats.numpy()
+                topk_pred = self.hc_soinn.predict_topk(
+                    feats_np, self.topk, self._total_classes, device=self._device
+                )
+                y_pred.append(topk_pred)
+                y_true.append(targets.cpu().numpy())
+
+        if len(y_pred) == 0:
+            logging.warning("No predictions generated from HC-SOINN evaluation")
+            return np.array([]), np.array([])
+
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def eval_task(self):
+        """
+        评估任务：分别评估FC、HC-SOINN（如果启用）分类器
+        返回所有分类器的精度结果
+        """
+        results = {}
+        
+        # 1. 使用原始FC分类器评估
+        y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
+        results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
+        
+        # 2. 使用 HC-SOINN 分类器评估（如果启用）
+        if getattr(self, "use_hc_soinn", False):
+            y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
+            results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
+        
+        return results
+    
+    def _eval_fc(self, loader):
+        """使用原始FC层进行评估"""
+        self._network.eval()
+        y_pred, y_true = [], []
+        
+        for _, (_, inputs, targets) in enumerate(loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                outputs = self._network(inputs)["logits"]
+            predicts = torch.topk(
+                outputs, k=self.topk, dim=1, largest=True, sorted=True
+            )[1]
+            y_pred.append(predicts.cpu().numpy())
+            y_true.append(targets.cpu().numpy())
+        return np.concatenate(y_pred), np.concatenate(y_true)
 
     
 
