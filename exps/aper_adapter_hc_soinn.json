@@ -1,5 +1,5 @@
 {
-    "prefix": "reproduce",
+    "prefix": "",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,

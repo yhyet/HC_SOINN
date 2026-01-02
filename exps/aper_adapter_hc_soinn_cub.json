@@ -1,5 +1,5 @@
 {
-    "prefix": "reproduce",
+    "prefix": "no_star",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -36,7 +36,7 @@
     "hcsoinn_soinn_max_iter": 1,
     "hcsoinn_soinn_max_degree_for_removal": 1,
 
-    "use_feature_alignment": true,
+    "use_feature_alignment": false,
     "use_full_task_rehearsal": false,
     "test_only_first_task_classes": false,
 
