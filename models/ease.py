@@ -586,6 +586,11 @@ class Learner(BaseLearner):
             self.hc_soinn.class_count = {}
             self.hc_soinn.class_clusters = {}
             self.hc_soinn.buffers = {}
+            # 清空class_mu_raw相关（避免维度不匹配）
+            if hasattr(self.hc_soinn, 'class_mu_raw'):
+                self.hc_soinn.class_mu_raw = {}
+            if hasattr(self.hc_soinn, 'class_mu_raw_original'):
+                self.hc_soinn.class_mu_raw_original = {}
             # 添加所有类别的特征（使用当前特征维度）
             self.hc_soinn.add_features(feats_np, lbs_np)
 

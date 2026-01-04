@@ -562,7 +562,11 @@ class HCSOINNClassifier:
 
             # 更新完整特征的class_mu（标准模式）
             cls_count_old = self.class_count.get(cls, 0)
-            cls_sum_old = self.class_mu_raw.get(cls, 0) * cls_count_old if cls in self.class_mu_raw else 0
+            if cls in self.class_mu_raw:
+                cls_sum_old = self.class_mu_raw[cls] * cls_count_old
+            else:
+                # 如果类别不存在，初始化为与特征相同维度的零数组
+                cls_sum_old = np.zeros(cls_feats.shape[1], dtype=np.float32)
             cls_sum_new = cls_sum_old + cls_feats.sum(axis=0)
             cls_count_new = cls_count_old + cls_feats.shape[0]
             self.class_count[cls] = cls_count_new
