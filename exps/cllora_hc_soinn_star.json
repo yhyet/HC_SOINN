@@ -38,8 +38,8 @@
     "use_distillation": true,
     "use_block_weight": true,
     "msa": [1, 0, 1],
-    "general_pos": [0, 1, 2, 3, 4, 5],
-    "specfic_pos": [6, 7, 8, 9, 10, 11],
+    "general_pos": [0, 1],
+    "specfic_pos": [2,3,4,5,6,7,8,9,10,11],
 
     "use_hc_soinn": true,
     "hcsoinn_max_proto_per_class": 60,
@@ -54,7 +54,7 @@
     "hcsoinn_soinn_threshold_scale": 0.8,
     "hcsoinn_soinn_max_iter": 1,
 
-    "use_feature_alignment": false,
+    "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
 
     "analyze_cluster_structure_drift": true
