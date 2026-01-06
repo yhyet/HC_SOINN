@@ -535,18 +535,71 @@ class Learner(BaseLearner):
         
         return feature_fn
 
+    def _expand_hc_soinn_dimension(self):
+        """
+        扩展 HC-SOINN 旧类别节点的特征维度，以匹配当前任务的特征空间
+        """
+        if not hasattr(self, "hc_soinn"):
+            return
+            
+        target_dim = self._network.feature_dim
+        logging.info(f"Expanding HC-SOINN dimension to {target_dim}")
+        
+        # 1. 处理 class_mu (NCM 中心)
+        expanded_count = 0
+        for cls, mu in self.hc_soinn.class_mu.items():
+            if mu.shape[0] < target_dim:
+                pad_len = target_dim - mu.shape[0]
+                new_mu = np.concatenate([mu, np.zeros(pad_len, dtype=mu.dtype)])
+                self.hc_soinn.class_mu[cls] = new_mu
+                expanded_count += 1
+                
+                # 同时更新 raw 版本
+                if hasattr(self.hc_soinn, "class_mu_raw") and cls in self.hc_soinn.class_mu_raw:
+                    mu_raw = self.hc_soinn.class_mu_raw[cls]
+                    new_mu_raw = np.concatenate([mu_raw, np.zeros(pad_len, dtype=mu_raw.dtype)])
+                    self.hc_soinn.class_mu_raw[cls] = new_mu_raw
+        
+        if expanded_count > 0:
+            logging.info(f"Expanded {expanded_count} classes in class_mu")
+
+        # 2. 处理 class_clusters (子簇中心)
+        expanded_cluster_count = 0
+        for cls, clusters in self.hc_soinn.class_clusters.items():
+            for cluster in clusters:
+                if cluster.center.shape[0] < target_dim:
+                    pad_len = target_dim - cluster.center.shape[0]
+                    new_center = np.concatenate([cluster.center, np.zeros(pad_len, dtype=cluster.center.dtype)])
+                    cluster.center = new_center
+                    expanded_cluster_count += 1
+                    
+                    # 同时更新 raw 版本
+                    if cluster.center_raw is not None:
+                        new_center_raw = np.concatenate([cluster.center_raw, np.zeros(pad_len, dtype=cluster.center_raw.dtype)])
+                        cluster.center_raw = new_center_raw
+        
+        if expanded_cluster_count > 0:
+            logging.info(f"Expanded {expanded_cluster_count} clusters in class_clusters")
+
     def _build_hc_soinn_bank(self):
         """
         构建 HC-SOINN bank：类增量学习场景下的累积存储
-        - 每个任务重新计算所有已见过的类别的特征（使用当前特征维度）
-        - 确保所有类别的特征维度一致，避免维度不匹配问题
+        - 扩展旧类别特征维度（补零）
+        - 仅添加当前任务的新类别数据
         """
         if not self.use_hc_soinn:
             return
 
         # 确保模型处于 eval 模式（重要：特征提取时应该关闭 dropout 等）
         self._network.eval()
+        
+        # 1. 先扩展旧类别的维度
+        self._expand_hc_soinn_dimension()
 
+        hc_bank_empty = (not hasattr(self, "hc_soinn")) or (len(getattr(self.hc_soinn, "class_clusters", {})) == 0)
+        if hc_bank_empty:
+            logging.info(f"HC-SOINN bank is empty!!!")
+        
         feature_fn = self._get_hc_soinn_feature_fn()
 
         def add_from_loader(loader):
