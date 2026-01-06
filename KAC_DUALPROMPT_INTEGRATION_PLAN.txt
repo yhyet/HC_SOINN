@@ -1,0 +1,153 @@
+KAC分类器集成到DualPrompt方法工作计划书
+==================================================
+
+项目目标
+--------
+将KAC分类器集成到LAMDA-PILOT_2项目的dualprompt方法中，参考codaprompt的集成方式，实现可训练的KAC分类器替换原有的线性分类器。
+
+参考实现分析
+------------
+1. Codaprompt集成方式回顾：
+   - 在CodaPromptVitNet中添加use_kac参数和kac_config配置
+   - 在__init__中根据use_kac选择KACLayer或nn.Linear
+   - 实现update_fc和generate_fc方法支持增量学习
+   - 在models/coda_prompt.py中添加参数解析、优化器配置、评估方法
+
+2. DualPrompt结构分析：
+   - 使用PromptVitNet类（utils/inc_net.py）
+   - PromptVitNet使用backbone（通过timm创建）
+   - 分类器在backbone内部：backbone/vit_dualprompt.py中的VisionTransformer类
+   - 分类器是self.head = nn.Linear(self.embed_dim, num_classes)
+   - forward中通过res['logits'] = self.head(x)输出logits
+
+具体任务清单
+------------
+
+阶段一：修改backbone以支持KAC分类器
+------------------------------------
+任务1.1: 修改backbone/vit_dualprompt.py中的VisionTransformer类
+- 在__init__方法中添加use_kac参数和kac_config配置
+- 修改self.head的初始化：
+  * 当use_kac=True时，使用KACLayer替代nn.Linear
+  * 当use_kac=False时，保持原有的nn.Linear实现
+- 确保KACLayer的输入维度是self.embed_dim（默认768）
+- 确保KACLayer的输出维度是num_classes
+
+任务1.2: 修改reset_classifier方法
+- 支持KAC分类器的重置
+- 当use_kac=True时，使用KACLayer
+- 当use_kac=False时，使用nn.Linear
+- 保持与原有接口兼容
+
+任务1.3: 添加KAC分类器的增量学习支持
+- 如果需要，添加update_head或类似方法支持类别扩展
+- 参考KACLayer的update方法实现
+
+阶段二：修改PromptVitNet类（可选）
+-----------------------------------
+任务2.1: 检查PromptVitNet是否需要修改
+- 查看PromptVitNet是否需要传递KAC参数给backbone
+- 如果需要，在PromptVitNet.__init__中传递use_kac和kac_config参数
+
+阶段三：修改dualprompt训练流程
+--------------------------------
+任务3.1: 修改models/dualprompt.py的__init__方法
+- 添加KAC参数解析：
+  * use_kac = args.get("use_kac", False)
+  * kac_config = args.get("kac_config", {})
+- 在创建PromptVitNet时传递KAC相关参数（如果需要）
+- 添加日志输出，显示KAC分类器的配置信息
+
+任务3.2: 修改参数统计
+- 更新total_trainable_params的计算，支持KAC分类器
+- 添加KAC分类器参数数量的单独统计和日志
+
+任务3.3: 检查优化器设置
+- 验证get_optimizer方法是否正确包含KAC分类器参数
+- KAC分类器参数应该通过self._network.backbone.head访问
+- 确保所有KAC参数都参与训练
+
+任务3.4: 检查训练循环
+- 验证_init_train方法中KAC分类器是否正常工作
+- 确保前向传播和反向传播流程正确
+- 验证logits维度正确
+
+阶段四：修改评估流程
+--------------------
+任务4.1: 检查评估方法
+- 查看_eval_cnn方法是否需要修改
+- KAC分类器已经集成在backbone.head中，应该可以直接使用
+- 如果需要，添加_eval_kac方法用于区分（可选）
+
+任务4.2: 检查eval_task方法（如果存在）
+- 如果dualprompt有eval_task方法，添加KAC评估分支
+- 参考codaprompt的实现方式
+
+阶段五：创建配置文件
+--------------------
+任务5.1: 创建KAC配置文件示例
+- 在exps/目录下创建：
+  * dualprompt_kac.json - CIFAR-100配置
+  * dualprompt_kac_cub.json - CUB-200配置（如果存在dualprompt_cub.json）
+  * dualprompt_kac_inr.json - ImageNet-R配置
+- 配置文件中包含：
+  * "use_kac": true
+  * "kac_config": 包含grid_min, grid_max, num_grids等参数
+  * 其他必要的训练参数
+
+关键技术点
+----------
+1. 分类器位置：dualprompt的分类器在backbone内部（self.head），而不是在PromptVitNet中
+2. 参数传递：需要将use_kac和kac_config从args传递到backbone的VisionTransformer
+3. 接口兼容：确保KACLayer的输出格式与nn.Linear兼容（都是logits）
+4. 增量学习：检查dualprompt是否需要支持增量学习的类别扩展
+
+实施顺序建议
+------------
+1. 阶段一 → 修改backbone（核心集成）
+2. 阶段二 → 检查PromptVitNet（如果需要）
+3. 阶段三 → 修改训练流程（功能实现）
+4. 阶段四 → 修改评估流程（验证功能）
+5. 阶段五 → 创建配置文件（便于使用）
+
+与Codaprompt集成的差异
+----------------------
+1. 分类器位置不同：
+   - Codaprompt: 在CodaPromptVitNet中（self.fc）
+   - DualPrompt: 在backbone内部（self.head）
+
+2. 网络结构不同：
+   - Codaprompt: 使用CodaPromptVitNet，有独立的fc层
+   - DualPrompt: 使用PromptVitNet，分类器在backbone内部
+
+3. 参数传递路径：
+   - Codaprompt: args → CodaPromptVitNet.__init__ → 直接创建fc
+   - DualPrompt: args → PromptVitNet.__init__ → get_backbone → timm.create_model → VisionTransformer.__init__
+
+4. 需要特别注意：
+   - DualPrompt通过timm.create_model创建backbone，需要确保KAC参数能正确传递
+   - 可能需要修改get_backbone函数或timm模型创建过程
+
+风险评估
+--------
+1. timm模型创建：timm.create_model可能不支持自定义参数，需要检查如何传递KAC参数
+2. 参数传递链：需要确保KAC参数从args正确传递到VisionTransformer
+3. 接口兼容性：确保KAC分类器与现有代码完全兼容
+
+成功标准
+--------
+1. KAC分类器可以成功训练
+2. 训练损失正常收敛
+3. 评估结果正确
+4. 可以与线性分类器切换使用
+5. 代码结构清晰，易于维护
+
+时间估算
+--------
+- 阶段一: 3-4小时（需要处理timm模型创建）
+- 阶段二: 1-2小时
+- 阶段三: 2-3小时
+- 阶段四: 1小时
+- 阶段五: 1小时
+总计: 8-11小时
+

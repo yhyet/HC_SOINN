@@ -565,33 +565,23 @@ class Learner(BaseLearner):
             lbs_np = np.concatenate(lbs, axis=0)
             return feats_np, lbs_np
 
-        # 重新计算所有已见过的类别的特征（使用当前特征维度）
-        # 使用测试数据，因为训练数据可能不可用（类增量学习设定）
-        logging.info(f"Building HC-SOINN bank: recomputing all seen classes (0-{self._total_classes-1}) with current feature dimension")
-        all_classes_dataset = self.data_manager.get_dataset(
-            np.arange(0, self._total_classes), source="test", mode="test"
+        # 类增量学习：每个任务只使用当前任务的新类别训练数据（符合类增量学习设定）
+        # 旧类别的信息通过已保存的簇中心保留（在 compress 时合并）
+        logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
+        current_task_dataset = self.data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes), source="train", mode="test"
         )
-        all_classes_loader = DataLoader(
-            all_classes_dataset,
+        current_task_loader = DataLoader(
+            current_task_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             drop_last=False,
             num_workers=num_workers,
         )
-        feats_np, lbs_np = add_from_loader(all_classes_loader)
+        feats_np, lbs_np = add_from_loader(current_task_loader)
         
         if feats_np is not None and len(feats_np) > 0:
-            # 清空旧的特征（避免维度不匹配）
-            self.hc_soinn.class_mu = {}
-            self.hc_soinn.class_count = {}
-            self.hc_soinn.class_clusters = {}
-            self.hc_soinn.buffers = {}
-            # 清空class_mu_raw相关（避免维度不匹配）
-            if hasattr(self.hc_soinn, 'class_mu_raw'):
-                self.hc_soinn.class_mu_raw = {}
-            if hasattr(self.hc_soinn, 'class_mu_raw_original'):
-                self.hc_soinn.class_mu_raw_original = {}
-            # 添加所有类别的特征（使用当前特征维度）
+            # HC-SOINN 标准模式：存储完整特征的原型
             self.hc_soinn.add_features(feats_np, lbs_np)
 
     def _eval_hc_soinn(self, loader):

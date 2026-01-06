@@ -16,6 +16,15 @@ num_workers = 8
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
+        
+        # KAC分类器支持
+        self.use_kac = args.get("use_kac", False)
+        if self.use_kac:
+            logging.info("KAC classifier enabled for DualPrompt")
+            kac_config = args.get("kac_config", {})
+            logging.info(f"KAC config: grid_min={kac_config.get('grid_min', -2.0)}, "
+                        f"grid_max={kac_config.get('grid_max', 2.0)}, "
+                        f"num_grids={kac_config.get('num_grids', 16)}")
     
         self._network = PromptVitNet(args, True)
 
@@ -39,6 +48,11 @@ class Learner(BaseLearner):
         logging.info(f'{total_params:,} model total parameters.')
         total_trainable_params = sum(p.numel() for p in self._network.backbone.parameters() if p.requires_grad)
         logging.info(f'{total_trainable_params:,} model training parameters.')
+        
+        # KAC分类器参数统计
+        if self.use_kac and hasattr(self._network.backbone, 'head'):
+            head_params = sum(p.numel() for p in self._network.backbone.head.parameters() if p.requires_grad)
+            logging.info(f'  - Head (KAC) parameters: {head_params:,}')
 
         # if some parameters are trainable, print the key name and corresponding parameter number
         if total_params != total_trainable_params:
@@ -84,23 +98,31 @@ class Learner(BaseLearner):
         self._init_train(train_loader, test_loader, optimizer, scheduler)
 
     def get_optimizer(self):
+        # 获取所有可训练参数（包括KAC分类器参数）
+        trainable_params = filter(lambda p: p.requires_grad, self._network.parameters())
+        
+        # 验证KAC分类器的参数是否被正确包含
+        if self.use_kac and hasattr(self._network.backbone, 'head'):
+            head_param_count = sum(p.numel() for p in self._network.backbone.head.parameters() if p.requires_grad)
+            logging.info(f"KAC classifier parameters included in optimizer: {head_param_count:,}")
+        
         if self.args['optimizer'] == 'sgd':
             optimizer = optim.SGD(
-                filter(lambda p: p.requires_grad, self._network.parameters()), 
+                trainable_params, 
                 momentum=0.9, 
                 lr=self.init_lr,
                 weight_decay=self.weight_decay
             )
         elif self.args['optimizer'] == 'adam':
             optimizer = optim.Adam(
-                filter(lambda p: p.requires_grad, self._network.parameters()),
+                trainable_params,
                 lr=self.init_lr, 
                 weight_decay=self.weight_decay
             )
             
         elif self.args['optimizer'] == 'adamw':
             optimizer = optim.AdamW(
-                filter(lambda p: p.requires_grad, self._network.parameters()),
+                trainable_params,
                 lr=self.init_lr, 
                 weight_decay=self.weight_decay
             )
@@ -215,6 +237,7 @@ class Learner(BaseLearner):
         logging.info(info)
 
     def _eval_cnn(self, loader):
+        """使用backbone分类器进行评估（支持KAC分类器）"""
         self._network.eval()
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):
@@ -230,6 +253,30 @@ class Learner(BaseLearner):
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+    
+    def _eval_kac(self, loader):
+        """使用KAC分类器进行评估（与_eval_cnn相同，但用于区分）"""
+        # KAC分类器已经集成在backbone.head中，所以可以直接使用_eval_cnn
+        return self._eval_cnn(loader)
+
+    def eval_task(self):
+        """
+        评估任务：评估backbone分类器（如果使用KAC，则评估KAC分类器）
+        返回分类器的精度结果
+        """
+        results = {}
+        
+        # 使用backbone分类器评估（如果使用KAC，则评估KAC分类器）
+        if self.use_kac:
+            y_pred_kac, y_true_kac = self._eval_kac(self.test_loader)
+            results["kac"] = self._evaluate(y_pred_kac, y_true_kac)
+            # 同时保留fc结果（KAC分类器就是fc层）
+            results["fc"] = results["kac"]
+        else:
+            y_pred_fc, y_true_fc = self._eval_cnn(self.test_loader)
+            results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
+        
+        return results
 
     def _compute_accuracy(self, model, loader):
         model.eval()

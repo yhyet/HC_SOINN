@@ -5,6 +5,7 @@ from torch import nn
 from backbone.linears import SimpleLinear, SplitCosineLinear, CosineLinear, EaseCosineLinear, SimpleContinualLinear, TunaLinear, CosineLinearFeature
 
 from backbone.prompt import CodaPrompt
+from utils.kac_classifier import KACLayer
 import timm
 
 def get_backbone(args, pretrained=False):
@@ -158,6 +159,10 @@ def get_backbone(args, pretrained=False):
     elif '_dualprompt' in name:
         if args["model_name"] == "dualprompt":
             from backbone import vit_dualprompt
+            # KAC分类器支持
+            use_kac = args.get("use_kac", False)
+            kac_config = args.get("kac_config", {})
+            
             model = timm.create_model(
                 args["backbone_type"],
                 pretrained=args["pretrained"],
@@ -184,6 +189,8 @@ def get_backbone(args, pretrained=False):
                 e_prompt_layer_idx=args["e_prompt_layer_idx"],
                 use_prefix_tune_for_e_prompt=args["use_prefix_tune_for_e_prompt"],
                 same_key_value=args["same_key_value"],
+                use_kac=use_kac,
+                kac_config=kac_config,
             )
             return model
         else:
@@ -772,7 +779,26 @@ class CodaPromptVitNet(nn.Module):
         super(CodaPromptVitNet, self).__init__()
         self.args = args
         self.backbone = get_backbone(args, pretrained)
-        self.fc = nn.Linear(768, args["nb_classes"])
+        
+        # KAC分类器支持
+        self.use_kac = args.get("use_kac", False)
+        kac_config = args.get("kac_config", {})
+        
+        if self.use_kac:
+            # 使用KAC分类器
+            logging.info("Using KAC classifier instead of linear classifier")
+            self.fc = KACLayer(
+                input_dim=768,
+                output_dim=args["nb_classes"],
+                grid_min=kac_config.get("grid_min", -2.0),
+                grid_max=kac_config.get("grid_max", 2.0),
+                num_grids=kac_config.get("num_grids", 16),
+                spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
+            )
+        else:
+            # 使用标准线性分类器
+            self.fc = nn.Linear(768, args["nb_classes"])
+        
         self.prompt = CodaPrompt(768, args["nb_tasks"], args["prompt_param"])
         # NCM分类器：用于存储类均值的FC层（使用CosineLinear，自动归一化）
         self.ncm_fc = CosineLinear(768, args["nb_classes"], sigma=False)
@@ -811,6 +837,72 @@ class CodaPromptVitNet(nn.Module):
             out = out[:,0,:]
         out = out.view(out.size(0), -1)
         return out
+    
+    def update_fc(self, nb_classes):
+        """
+        增量学习场景下的类别扩展
+        
+        Args:
+            nb_classes: 新的类别总数
+        """
+        if self.use_kac:
+            # KAC分类器：使用update方法扩展输出维度
+            if hasattr(self.fc, 'update'):
+                self.fc.update(nb_classes)
+            else:
+                # 如果KACLayer没有update方法，重新创建
+                kac_config = self.args.get("kac_config", {})
+                old_fc = self.fc
+                self.fc = KACLayer(
+                    input_dim=768,
+                    output_dim=nb_classes,
+                    grid_min=kac_config.get("grid_min", -2.0),
+                    grid_max=kac_config.get("grid_max", 2.0),
+                    num_grids=kac_config.get("num_grids", 16),
+                    spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
+                )
+                # 尝试复制旧权重（如果维度兼容）
+                if hasattr(old_fc, 'spline_linear') and hasattr(self.fc, 'spline_linear'):
+                    old_out_dim = old_fc.output_dim
+                    if old_out_dim <= nb_classes:
+                        self.fc.spline_linear.weight.data[:old_out_dim, :] = old_fc.spline_linear.weight.data
+        else:
+            # 标准线性分类器：保存旧权重并扩展
+            if self.fc is not None:
+                nb_output = self.fc.out_features
+                weight = copy.deepcopy(self.fc.weight.data)
+                bias = copy.deepcopy(self.fc.bias.data)
+            else:
+                nb_output = 0
+            
+            fc = self.generate_fc(768, nb_classes)
+            if self.fc is not None:
+                fc.weight.data[:nb_output] = weight
+                fc.bias.data[:nb_output] = bias
+            
+            del self.fc
+            self.fc = fc
+    
+    def generate_fc(self, in_dim, out_dim):
+        """
+        生成分类器层
+        
+        Args:
+            in_dim: 输入维度
+            out_dim: 输出维度
+        """
+        if self.use_kac:
+            kac_config = self.args.get("kac_config", {})
+            return KACLayer(
+                input_dim=in_dim,
+                output_dim=out_dim,
+                grid_min=kac_config.get("grid_min", -2.0),
+                grid_max=kac_config.get("grid_max", 2.0),
+                num_grids=kac_config.get("num_grids", 16),
+                spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
+            )
+        else:
+            return nn.Linear(in_dim, out_dim)
 
 
 class MultiBranchCosineIncrementalNet(BaseNet):

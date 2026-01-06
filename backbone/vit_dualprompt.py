@@ -41,6 +41,7 @@ from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_n
 from timm.models.registry import register_model
 
 from backbone.prompt import EPrompt
+from utils.kac_classifier import KACLayer
 
 _logger = logging.getLogger(__name__)
 
@@ -379,7 +380,8 @@ class VisionTransformer(nn.Module):
             prompt_length=None, embedding_key='cls', prompt_init='uniform', prompt_pool=False, prompt_key=False, pool_size=None,
             top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,
             use_g_prompt=False, g_prompt_length=None, g_prompt_layer_idx=None, use_prefix_tune_for_g_prompt=False,
-            use_e_prompt=False, e_prompt_layer_idx=None, use_prefix_tune_for_e_prompt=False, same_key_value=False,):
+            use_e_prompt=False, e_prompt_layer_idx=None, use_prefix_tune_for_e_prompt=False, same_key_value=False,
+            use_kac=False, kac_config=None):
         """
         Args:
             img_size (int, tuple): input image size
@@ -509,7 +511,26 @@ class VisionTransformer(nn.Module):
 
         # Classifier Head
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        
+        # KAC分类器支持
+        self.use_kac = use_kac
+        if kac_config is None:
+            kac_config = {}
+        self.kac_config = kac_config  # 保存KAC配置（用于reset_classifier）
+        
+        if self.use_kac:
+            # 使用KAC分类器
+            self.head = KACLayer(
+                input_dim=self.embed_dim,
+                output_dim=num_classes,
+                grid_min=kac_config.get("grid_min", -2.0),
+                grid_max=kac_config.get("grid_max", 2.0),
+                num_grids=kac_config.get("num_grids", 16),
+                spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
+            ) if num_classes > 0 else nn.Identity()
+        else:
+            # 使用标准线性分类器
+            self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
@@ -554,7 +575,28 @@ class VisionTransformer(nn.Module):
         if global_pool is not None:
             assert global_pool in ('', 'avg', 'token')
             self.global_pool = global_pool
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        
+        # KAC分类器支持
+        if self.use_kac:
+            # 如果已有KAC分类器，使用update方法扩展
+            if hasattr(self.head, 'update') and num_classes > 0:
+                self.head.update(num_classes)
+            else:
+                # 重新创建KAC分类器
+                kac_config = getattr(self, 'kac_config', {})
+                if kac_config is None:
+                    kac_config = {}
+                self.head = KACLayer(
+                    input_dim=self.embed_dim,
+                    output_dim=num_classes,
+                    grid_min=kac_config.get("grid_min", -2.0),
+                    grid_max=kac_config.get("grid_max", 2.0),
+                    num_grids=kac_config.get("num_grids", 16),
+                    spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
+                ) if num_classes > 0 else nn.Identity()
+        else:
+            # 使用标准线性分类器
+            self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x, task_id=-1, cls_features=None, train=False):
         x = self.patch_embed(x)

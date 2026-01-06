@@ -29,6 +29,15 @@ class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
     
+        # KAC分类器支持
+        self.use_kac = args.get("use_kac", False)
+        if self.use_kac:
+            logging.info("KAC classifier enabled")
+            kac_config = args.get("kac_config", {})
+            logging.info(f"KAC config: grid_min={kac_config.get('grid_min', -2.0)}, "
+                        f"grid_max={kac_config.get('grid_max', 2.0)}, "
+                        f"num_grids={kac_config.get('num_grids', 16)}")
+        
         self._network = CodaPromptVitNet(args, True)
 
         self.batch_size = args["batch_size"]
@@ -91,8 +100,15 @@ class Learner(BaseLearner):
         
         total_params = sum(p.numel() for p in self._network.parameters())
         logging.info(f'{total_params:,} total parameters.')
-        total_trainable_params = sum(p.numel() for p in self._network.fc.parameters() if p.requires_grad) + sum(p.numel() for p in self._network.prompt.parameters() if p.requires_grad)
+        
+        # 计算可训练参数（支持KAC分类器）
+        fc_params = sum(p.numel() for p in self._network.fc.parameters() if p.requires_grad)
+        prompt_params = sum(p.numel() for p in self._network.prompt.parameters() if p.requires_grad)
+        total_trainable_params = fc_params + prompt_params
         logging.info(f'{total_trainable_params:,} fc and prompt training parameters.')
+        if self.use_kac:
+            logging.info(f'  - FC (KAC) parameters: {fc_params:,}')
+            logging.info(f'  - Prompt parameters: {prompt_params:,}')
         
         # 实验模式：只测试第一个任务的类别（用于分析特征漂移 vs 新类别干扰）
         self.test_only_first_task_classes = args.get("test_only_first_task_classes", False)
@@ -851,6 +867,12 @@ class Learner(BaseLearner):
             params = list(self._network.module.prompt.parameters()) + list(self._network.module.fc.parameters())
         else:
             params = list(self._network.prompt.parameters()) + list(self._network.fc.parameters())
+        
+        # 验证KAC分类器的参数是否被正确包含
+        if self.use_kac:
+            fc_param_count = sum(p.numel() for p in self._network.fc.parameters() if p.requires_grad)
+            logging.info(f"KAC classifier parameters included in optimizer: {fc_param_count:,}")
+        
         if self.args['optimizer'] == 'sgd':
             optimizer = optim.SGD(params, momentum=0.9, lr=self.init_lr,weight_decay=self.weight_decay)
         elif self.args['optimizer'] == 'adam':
@@ -928,7 +950,7 @@ class Learner(BaseLearner):
         logging.info(info)
 
     def _eval_fc(self, loader):
-        """使用原始FC层进行评估"""
+        """使用原始FC层进行评估（支持KAC分类器）"""
         self._network.eval()
         y_pred, y_true = [], []
         # 实验模式：只使用第一个任务的类别
@@ -947,6 +969,11 @@ class Learner(BaseLearner):
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
         return np.concatenate(y_pred), np.concatenate(y_true)
+    
+    def _eval_kac(self, loader):
+        """使用KAC分类器进行评估（与_eval_fc相同，但用于区分）"""
+        # KAC分类器已经集成在self._network.fc中，所以可以直接使用_eval_fc
+        return self._eval_fc(loader)
     
     def _eval_knn(self, loader):
         """使用KNN分类器进行评估"""
@@ -1092,9 +1119,15 @@ class Learner(BaseLearner):
         
         results = {}
         
-        # 1. 使用原始FC分类器评估
-        y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
-        results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
+        # 1. 使用原始FC分类器评估（如果使用KAC，则评估KAC分类器）
+        if self.use_kac:
+            y_pred_kac, y_true_kac = self._eval_kac(self.test_loader)
+            results["kac"] = self._evaluate(y_pred_kac, y_true_kac)
+            # 同时保留fc结果（KAC分类器就是fc层）
+            results["fc"] = results["kac"]
+        else:
+            y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
+            results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
         
         # 2. 使用KNN分类器评估（如果启用）
         if getattr(self, "use_knn", False):
