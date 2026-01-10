@@ -538,6 +538,7 @@ class Learner(BaseLearner):
     def _expand_hc_soinn_dimension(self):
         """
         扩展 HC-SOINN 旧类别节点的特征维度，以匹配当前任务的特征空间
+        修正：使用 EASE 的 feature synthesis 结果，并根据特征模长进行缩放对齐
         """
         if not hasattr(self, "hc_soinn"):
             return
@@ -545,41 +546,148 @@ class Learner(BaseLearner):
         target_dim = self._network.feature_dim
         logging.info(f"Expanding HC-SOINN dimension to {target_dim}")
         
+        # 获取 FC 层的权重（包含了 solve_similarity 计算出的合成特征）
+        fc_weights = self._network.fc.weight.data.cpu().numpy()
+        
         # 1. 处理 class_mu (NCM 中心)
         expanded_count = 0
+        
+        # 预先计算缩放因子缓存，供 clusters 使用
+        cls_scales = {} 
+        cls_paddings = {}
+
         for cls, mu in self.hc_soinn.class_mu.items():
             if mu.shape[0] < target_dim:
-                pad_len = target_dim - mu.shape[0]
-                new_mu = np.concatenate([mu, np.zeros(pad_len, dtype=mu.dtype)])
+                current_dim = mu.shape[0]
+                pad_len = target_dim - current_dim
+                
+                if cls < len(fc_weights):
+                    # 获取 FC 权重对应的部分
+                    # 注意：FC权重可能已经被 EASE 归一化或处理过
+                    w_old = fc_weights[cls, :current_dim]
+                    w_new = fc_weights[cls, current_dim:]
+                    
+                    # 计算缩放因子：将 FC 权重的尺度映射回原始特征的尺度
+                    # 假设：RawFeature / FCWeight = Scale
+                    # 我们希望 NewFeature / NewFCWeight = Scale
+                    # 所以 NewFeature = NewFCWeight * (RawFeatureNorm / OldFCWeightNorm)
+                    
+                    w_old_norm = np.linalg.norm(w_old)
+                    mu_norm = np.linalg.norm(mu)
+                    
+                    if w_old_norm > 1e-6:
+                        scale = mu_norm / w_old_norm
+                    else:
+                        scale = 1.0
+                        logging.warning(f"Class {cls} old FC weight norm is too small ({w_old_norm}), using scale 1.0")
+
+                    # 如果 w_new 维度不足（例如跨任务跳跃），需要补零
+                    if w_new.shape[0] < pad_len:
+                         logging.warning(f"Class {cls} FC weight dim {w_new.shape[0]} < pad_len {pad_len}, padding with zeros")
+                         w_new = np.concatenate([w_new, np.zeros(pad_len - w_new.shape[0], dtype=w_new.dtype)])
+                    elif w_new.shape[0] > pad_len:
+                        w_new = w_new[:pad_len]
+
+                    real_padding = w_new * scale
+                    
+                    # 记录调试信息 (仅对第一个类别)
+                    if expanded_count == 0:
+                        logging.info(f"DEBUG HC-SOINN Expand: cls={cls}")
+                        logging.info(f"  mu_norm={mu_norm:.4f}, w_old_norm={w_old_norm:.4f}, scale={scale:.4f}")
+                        logging.info(f"  w_new_norm={np.linalg.norm(w_new):.4f}, real_padding_norm={np.linalg.norm(real_padding):.4f}")
+                    
+                    # 缓存以供 cluster 使用
+                    cls_scales[cls] = scale
+                    cls_paddings[cls] = w_new # 存储原始方向，cluster可能有不同的 scale
+                else:
+                    logging.warning(f"Class {cls} not found in FC weights, padding with zeros")
+                    real_padding = np.zeros(pad_len, dtype=mu.dtype)
+                    cls_scales[cls] = 1.0
+                    cls_paddings[cls] = np.zeros(pad_len, dtype=mu.dtype)
+
+                new_mu = np.concatenate([mu, real_padding])
                 self.hc_soinn.class_mu[cls] = new_mu
                 expanded_count += 1
                 
-                # 同时更新 raw 版本
+                # 同时更新 raw 版本 (使用相同的逻辑)
                 if hasattr(self.hc_soinn, "class_mu_raw") and cls in self.hc_soinn.class_mu_raw:
                     mu_raw = self.hc_soinn.class_mu_raw[cls]
-                    new_mu_raw = np.concatenate([mu_raw, np.zeros(pad_len, dtype=mu_raw.dtype)])
+                    # raw 特征可能没有归一化，重新计算 scale
+                    mu_raw_norm = np.linalg.norm(mu_raw)
+                    w_old_norm = np.linalg.norm(fc_weights[cls, :current_dim])
+                    if w_old_norm > 1e-6:
+                        scale_raw = mu_raw_norm / w_old_norm
+                    else:
+                        scale_raw = 1.0
+                    
+                    real_padding_raw = cls_paddings[cls] * scale_raw
+                    new_mu_raw = np.concatenate([mu_raw, real_padding_raw])
                     self.hc_soinn.class_mu_raw[cls] = new_mu_raw
         
         if expanded_count > 0:
-            logging.info(f"Expanded {expanded_count} classes in class_mu")
+            logging.info(f"Expanded {expanded_count} classes in class_mu using Scaled EASE synthesis")
 
         # 2. 处理 class_clusters (子簇中心)
         expanded_cluster_count = 0
         for cls, clusters in self.hc_soinn.class_clusters.items():
+            w_new = cls_paddings.get(cls)
+            # 这里我们使用类级别的 scale 还是 cluster 级别的 scale?
+            # cluster.center 也是特征空间的一个点。应该使用 cluster 自身的模长来计算 scale。
+            # 因为不同的 cluster 可能模长不同（虽然在 Normalized Feature Space 应该都接近 1，但 HC-SOINN 可能存的是未归一化的）
+            # 不过 EASE 的 w_new 是基于 Class 级别的 Similarity 算出来的。方向是固定的。
+            # 我们可以假设 Cluster 的分布趋势和 Class Mean 一致，使用 Cluster 自身的 Norm 来缩放 w_new。
+            
+            # 获取 w_old 的 norm (类级别)
+            if cls < len(fc_weights) and clusters:
+                 current_dim = clusters[0].center.shape[0]
+                 w_old_norm = np.linalg.norm(fc_weights[cls, :current_dim])
+            else:
+                 w_old_norm = 1.0
+
             for cluster in clusters:
                 if cluster.center.shape[0] < target_dim:
-                    pad_len = target_dim - cluster.center.shape[0]
-                    new_center = np.concatenate([cluster.center, np.zeros(pad_len, dtype=cluster.center.dtype)])
+                    current_dim = cluster.center.shape[0]
+                    pad_len = target_dim - current_dim
+                    
+                    if w_new is not None:
+                        # 针对每个 cluster 单独计算 scale
+                        cluster_norm = np.linalg.norm(cluster.center)
+                        if w_old_norm > 1e-6:
+                            scale = cluster_norm / w_old_norm
+                        else:
+                            scale = 1.0
+                        
+                        # 确保 w_new 长度匹配
+                        if w_new.shape[0] < pad_len:
+                            w_new_pad = np.concatenate([w_new, np.zeros(pad_len - w_new.shape[0], dtype=w_new.dtype)])
+                        elif w_new.shape[0] > pad_len:
+                            w_new_pad = w_new[:pad_len]
+                        else:
+                            w_new_pad = w_new
+
+                        real_padding = w_new_pad * scale
+                    else:
+                        real_padding = np.zeros(pad_len, dtype=cluster.center.dtype)
+
+                    new_center = np.concatenate([cluster.center, real_padding])
                     cluster.center = new_center
                     expanded_cluster_count += 1
                     
                     # 同时更新 raw 版本
                     if cluster.center_raw is not None:
-                        new_center_raw = np.concatenate([cluster.center_raw, np.zeros(pad_len, dtype=cluster.center_raw.dtype)])
+                         # 对 raw 版本也做同样的处理
+                        cluster_raw_norm = np.linalg.norm(cluster.center_raw)
+                        if w_old_norm > 1e-6:
+                            scale_raw = cluster_raw_norm / w_old_norm
+                        else:
+                            scale_raw = 1.0
+                        
+                        real_padding_raw = w_new_pad * scale_raw
+                        new_center_raw = np.concatenate([cluster.center_raw, real_padding_raw])
                         cluster.center_raw = new_center_raw
         
         if expanded_cluster_count > 0:
-            logging.info(f"Expanded {expanded_cluster_count} clusters in class_clusters")
+            logging.info(f"Expanded {expanded_cluster_count} clusters in class_clusters using Scaled EASE synthesis")
 
     def _build_hc_soinn_bank(self):
         """
@@ -657,8 +765,15 @@ class Learner(BaseLearner):
                 elif len(feats.shape) != 2:
                     raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
                 feats_np = feats.numpy()
+                
+                # 使用 EASE 风格的 Reweighting 距离
                 topk_pred = self.hc_soinn.predict_topk(
-                    feats_np, self.topk, self._total_classes, device=self._device
+                    feats_np, self.topk, self._total_classes, device=self._device,
+                    use_ease_reweighting=True,
+                    cur_task=self._cur_task,
+                    task_increment=self.inc,
+                    init_cls=self.init_cls,
+                    ease_alpha=self.alpha
                 )
                 y_pred.append(topk_pred)
                 y_true.append(targets.cpu().numpy())

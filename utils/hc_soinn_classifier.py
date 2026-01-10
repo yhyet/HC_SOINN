@@ -679,11 +679,27 @@ class HCSOINNClassifier:
     # 预测 (GPU 加速版)
     # ------------------------------------------------------------------ #
     def predict_topk(
-        self, query_features: np.ndarray, topk: int, total_classes: int, device=None
+        self, query_features: np.ndarray, topk: int, total_classes: int, device=None,
+        use_ease_reweighting: bool = False,
+        cur_task: int = 0,
+        task_increment: int = 10,
+        init_cls: int = 10,
+        ease_alpha: float = 0.5
     ) -> np.ndarray:
         """
         返回 shape [N, topk] 的类别索引
         使用 GPU 矩阵运算加速
+        
+        Args:
+            query_features: [N, D] 查询特征
+            topk: 返回前K个
+            total_classes: 总类别数（用于fallback）
+            device: 计算设备
+            use_ease_reweighting: 是否使用 EASE 风格的分块加权距离
+            cur_task: 当前任务 ID (用于 EASE reweighting)
+            task_increment: 增量大小 (用于 EASE reweighting)
+            init_cls: 初始类别数 (用于 EASE reweighting)
+            ease_alpha: EASE 的 alpha 参数
         """
         if query_features.shape[0] == 0:
             return np.zeros((0, topk), dtype=np.int64)
@@ -700,38 +716,113 @@ class HCSOINNClassifier:
             fallback = np.arange(min(topk, max(total_classes, 1)), dtype=np.int64)
             return np.tile(fallback, (query_features.shape[0], 1))
         
-        # 构建 NCM 中心 Tensor
-        ncm_centers = []
-        valid_classes = []
-        for cls in classes:
-            cls_mu = self.class_mu[cls]
-            # 只使用维度匹配的类别
-            if cls_mu.shape[0] == query_dim:
-                ncm_centers.append(cls_mu)
-                valid_classes.append(cls)
-            else:
-                logging.debug(
-                    f"Skipping class {cls} in NCM prediction: "
-                    f"class_mu dim={cls_mu.shape[0]}, query dim={query_dim}"
-                )
+        # 筛选有效类别
+        valid_classes = [cls for cls in classes if self.class_mu[cls].shape[0] == query_dim]
         
-        if not ncm_centers:
-            logging.warning(
-                f"No valid NCM centers found for query dim={query_dim}. "
-                f"Available class_mu dims: {[self.class_mu[cls].shape[0] for cls in classes]}"
-            )
+        if not valid_classes:
             return np.zeros((query_features.shape[0], topk), dtype=np.int64)
 
-        ncm_centers_t = torch.from_numpy(np.stack(ncm_centers)).float().to(device)
         query_t = torch.from_numpy(query_features).float().to(device)
         
-        query_t = torch.nn.functional.normalize(query_t, p=2, dim=1)
-        ncm_centers_t = torch.nn.functional.normalize(ncm_centers_t, p=2, dim=1)
+        # -----------------------------------------------------------
+        # 辅助函数：计算距离 (支持 EASE Reweighting 或 标准 Cosine)
+        # -----------------------------------------------------------
+        def compute_distance(protos_t, labels_t=None):
+            """
+            protos_t: [M, D] 原型向量
+            labels_t: [M] 对应的类别标签 (仅用于 EASE reweighting)
+            Return: [N, M] 距离矩阵
+            """
+            if use_ease_reweighting and cur_task > 0:
+                # EASE 风格：分块归一化 + 加权点积
+                # chunk_dim = 768 (假设)
+                chunk_dim = 768 # 硬编码或从参数推断
+                num_chunks = query_dim // chunk_dim
+                
+                # Reshape: [N, T, C]
+                q_chunks = query_t.view(query_t.shape[0], num_chunks, chunk_dim)
+                p_chunks = protos_t.view(protos_t.shape[0], num_chunks, chunk_dim)
+                
+                # Normalize each chunk independently
+                q_chunks = torch.nn.functional.normalize(q_chunks, p=2, dim=2)
+                p_chunks = torch.nn.functional.normalize(p_chunks, p=2, dim=2)
+                
+                # Compute dot product per chunk: [N, M, T]
+                # q: [N, T, D'] -> [N, 1, T, D']
+                # p: [M, T, D'] -> [1, M, T, D']
+                # product: sum(q * p, dim=-1) -> [N, M, T]
+                sim_per_chunk = (q_chunks.unsqueeze(1) * p_chunks.unsqueeze(0)).sum(dim=-1)
+                
+                # Apply weights
+                # Weights depend on:
+                # 1. Chunk index (j in 0..T-1)
+                # 2. Class Task ID (i in 0..T-1)
+                
+                # Determine task_id for each prototype
+                # labels_t: [M]
+                if labels_t is None: # NCM case where protos are ordered by valid_classes
+                    proto_task_ids = []
+                    for c in valid_classes:
+                        if c < init_cls:
+                            tid = 0
+                        else:
+                            tid = (c - init_cls) // task_increment + 1
+                        proto_task_ids.append(tid)
+                    proto_task_ids = torch.tensor(proto_task_ids, device=device) # [M]
+                else:
+                    # Map labels to task ids
+                    # This is slow, better vectorized
+                    proto_task_ids = torch.zeros_like(labels_t)
+                    mask_init = labels_t < init_cls
+                    proto_task_ids[mask_init] = 0
+                    proto_task_ids[~mask_init] = (labels_t[~mask_init] - init_cls) // task_increment + 1
+                
+                # Construct weight matrix [M, T]
+                # If chunk_idx != task_id: weight = alpha / cur_task
+                # Else: weight = 1.0
+                # Note: EASE logic is: if j != i: alpha/cur_task.
+                # Here j is chunk_idx (0..cur_task), i is proto_task_id
+                
+                M = protos_t.shape[0]
+                T = num_chunks
+                weights = torch.ones(M, T, device=device)
+                
+                # Expand proto_task_ids to [M, T]
+                task_ids_expanded = proto_task_ids.unsqueeze(1).expand(M, T) # [M, T]
+                chunk_indices = torch.arange(T, device=device).unsqueeze(0).expand(M, T) # [M, T]
+                
+                # Apply penalty mask
+                penalty_mask = (chunk_indices != task_ids_expanded)
+                # re-weight factor from EASE
+                factor = ease_alpha / float(cur_task)
+                weights[penalty_mask] = factor
+                
+                # Weighted Sum: [N, M]
+                # sim_per_chunk: [N, M, T]
+                # weights: [M, T] -> [1, M, T]
+                weighted_sim = (sim_per_chunk * weights.unsqueeze(0)).sum(dim=2)
+                
+                return 1.0 - weighted_sim # Convert to distance-like (sort order)
+                
+            else:
+                # 标准 Cosine Distance
+                p_norm = torch.nn.functional.normalize(protos_t, p=2, dim=1)
+                q_norm = torch.nn.functional.normalize(query_t, p=2, dim=1)
+                sim = torch.mm(q_norm, p_norm.t())
+                return 1.0 - sim
+
+        # -----------------------------------------------------------
+        # 1. 计算 NCM 距离
+        # -----------------------------------------------------------
+        ncm_centers_np = np.stack([self.class_mu[cls] for cls in valid_classes])
+        ncm_centers_t = torch.from_numpy(ncm_centers_np).float().to(device)
         
-        sim_ncm = torch.mm(query_t, ncm_centers_t.t())
-        dist_ncm = 1.0 - sim_ncm  # [N, C]
+        # NCM 不需要 label 参数，因为顺序对应 valid_classes
+        dist_ncm = compute_distance(ncm_centers_t)  # [N, C]
         
-        # 计算子簇距离
+        # -----------------------------------------------------------
+        # 2. 计算 Sub-Cluster 距离
+        # -----------------------------------------------------------
         all_protos = []
         proto_labels = []
         
@@ -744,18 +835,16 @@ class HCSOINNClassifier:
                     all_protos.append(cls_protos)
                     proto_labels.extend([cls] * len(clusters))
             else:
-                if cls in self.class_mu and self.class_mu[cls].shape[0] == query_dim:
-                    all_protos.append(self.class_mu[cls][np.newaxis, :])
-                    proto_labels.append(cls)
+                # Fallback to class center if no clusters
+                all_protos.append(self.class_mu[cls][np.newaxis, :])
+                proto_labels.append(cls)
         
         if all_protos:
             all_protos_np = np.concatenate(all_protos, axis=0)
             all_protos_t = torch.from_numpy(all_protos_np).float().to(device)
-            all_protos_t = torch.nn.functional.normalize(all_protos_t, p=2, dim=1)
             proto_labels_t = torch.tensor(proto_labels, device=device)
             
-            sim_proto = torch.mm(query_t, all_protos_t.t())
-            dist_proto_all = 1.0 - sim_proto
+            dist_proto_all = compute_distance(all_protos_t, proto_labels_t) # [N, M_total]
             
             dist_sub = torch.full_like(dist_ncm, float('inf'))
             for i, cls in enumerate(valid_classes):
