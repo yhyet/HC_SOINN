@@ -596,8 +596,10 @@ class HCSOINNClassifier:
 
             # 可选：将旧簇中心也纳入，避免完全遗忘已有结构
             if cls in self.class_clusters and len(self.class_clusters[cls]) > 0:
-                old_centers = np.stack([c.center for c in self.class_clusters[cls]], axis=0)
-                feats = np.concatenate([feats, old_centers], axis=0)
+                # FIX: 使用 center_raw (未归一化) 以保持特征尺度一致
+                # 如果混合了归一化(norm=1)和未归一化(norm~80)的特征，会导致聚类中心漂移
+                old_centers_raw = np.stack([c.center_raw for c in self.class_clusters[cls]], axis=0)
+                feats = np.concatenate([feats, old_centers_raw], axis=0)
 
             target_k = feats.shape[0] if self.max_prototypes_per_class is None else min(
                 self.max_prototypes_per_class, feats.shape[0]

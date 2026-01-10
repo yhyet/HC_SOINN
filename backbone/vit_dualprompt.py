@@ -680,6 +680,7 @@ class VisionTransformer(nn.Module):
         res['pre_logits'] = x
 
         x = self.fc_norm(x)
+        res['features'] = x  # 保存 norm 后的特征用于 NCM/HC-SOINN
         
         res['logits'] = self.head(x)
         

@@ -744,14 +744,23 @@ class SimpleVitNetKNN(BaseNet):
         return out
 
 # l2p and dualprompt
+from backbone.linears import SimpleLinear, SplitCosineLinear, CosineLinear, EaseCosineLinear, SimpleContinualLinear, TunaLinear, CosineLinearFeature
+from utils.kac_classifier import KACLayer
+import copy
+
 class PromptVitNet(nn.Module):
     def __init__(self, args, pretrained):
         super(PromptVitNet, self).__init__()
+        self.args = args
         self.backbone = get_backbone(args, pretrained)
         if args["get_original_backbone"]:
             self.original_backbone = self.get_original_backbone(args)
         else:
             self.original_backbone = None
+        
+        # NCM分类器：用于存储类均值的FC层
+        self.ncm_fc = CosineLinear(768, args["nb_classes"], sigma=False)
+        self.feature_dim = 768
             
     def get_original_backbone(self, args):
         return timm.create_model(
@@ -772,6 +781,22 @@ class PromptVitNet(nn.Module):
 
         x = self.backbone(x, task_id=task_id, cls_features=cls_features, train=train)
         return x
+
+    def extract_vector(self, x, task_id=-1):
+        """提取特征向量，用于NCM、KNN、HC-SOINN分类器"""
+        with torch.no_grad():
+            if self.original_backbone is not None:
+                cls_features = self.original_backbone(x)['pre_logits']
+            else:
+                cls_features = None
+        
+        res = self.backbone(x, task_id=task_id, cls_features=cls_features, train=False)
+        # 从字典结果中提取特征
+        if isinstance(res, dict):
+            if 'features' in res:
+                return res['features']
+            return res['pre_logits']
+        return res
 
 # coda_prompt
 class CodaPromptVitNet(nn.Module):
