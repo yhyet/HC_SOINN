@@ -718,11 +718,16 @@ class HCSOINNClassifier:
             fallback = np.arange(min(topk, max(total_classes, 1)), dtype=np.int64)
             return np.tile(fallback, (query_features.shape[0], 1))
         
-        # 筛选有效类别
-        valid_classes = [cls for cls in classes if self.class_mu[cls].shape[0] == query_dim]
+        # 筛选有效类别：1) 维度匹配 2) 在 total_classes 范围内（增量学习评估时只预测已见过的类别）
+        valid_classes = [
+            cls for cls in classes 
+            if self.class_mu[cls].shape[0] == query_dim and cls < total_classes
+        ]
         
         if not valid_classes:
-            return np.zeros((query_features.shape[0], topk), dtype=np.int64)
+            # 如果没有有效类别，返回 fallback（在 total_classes 范围内的类别）
+            fallback = np.arange(min(topk, max(total_classes, 1)), dtype=np.int64)
+            return np.tile(fallback, (query_features.shape[0], 1))
 
         query_t = torch.from_numpy(query_features).float().to(device)
         
@@ -870,7 +875,29 @@ class HCSOINNClassifier:
         
         # 转换回原始类别ID
         valid_classes_t = np.array(valid_classes)
-        top_preds = valid_classes_t[indices]  # [N, topk]
+        top_preds = valid_classes_t[indices]  # [N, k] (k <= topk)
+        
+        # 如果预测结果不足 topk 个，用其他类别补齐（在 total_classes 范围内）
+        if k < topk:
+            N = top_preds.shape[0]
+            all_classes = np.arange(total_classes, dtype=np.int64)
+            padded_preds = []
+            
+            for i in range(N):
+                pred_list = top_preds[i].tolist()
+                pred_set = set(pred_list)
+                # 获取未在预测中的其他类别
+                remaining = [c for c in all_classes if c not in pred_set]
+                # 补齐到 topk 个
+                padding = remaining[:topk - k]
+                pred_list.extend(padding)
+                # 如果还不够，重复最后一个类别
+                if len(pred_list) < topk:
+                    last_pred = pred_list[-1] if pred_list else 0
+                    pred_list.extend([last_pred] * (topk - len(pred_list)))
+                padded_preds.append(pred_list[:topk])
+            
+            top_preds = np.array(padded_preds, dtype=np.int64)
         
         return top_preds
 

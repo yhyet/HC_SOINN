@@ -1,5 +1,5 @@
 {
-    "prefix": "",
+    "prefix": "star",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -44,7 +44,7 @@
     "checkpoint_name": "coda_prompt_hc_soinn_inr",
     "load_all_checkpoints": false,
 
-    "use_feature_alignment": false,
+    "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
     "test_only_first_task_classes": false,
 

@@ -244,3 +244,4 @@ class KACClassifier(nn.Module):
         # 注意：KAC的权重结构不同，这里返回样条线性层的权重
         return self.kac_layer.spline_linear.weight
 
+

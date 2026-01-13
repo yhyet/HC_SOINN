@@ -250,7 +250,7 @@ class Learner(BaseLearner):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
                 logits = self._network(inputs)["logits"]
 
-                loss = F.cross_entropy(logits, targets)
+                loss = F.cross_entropy(logits, targets.long())
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
