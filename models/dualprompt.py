@@ -83,7 +83,9 @@ class Learner(BaseLearner):
                 hc_soinn=self.hc_soinn,
                 feature_extractor=feature_extractor,
                 device=self._device,
-                use_full_task_rehearsal=self.use_full_task_rehearsal
+                use_full_task_rehearsal=self.use_full_task_rehearsal,
+                star_mode=args.get("star_mode", "rigid"),
+                star_lambda=args.get("star_lambda", 0.3),
             )
 
         # 簇结构分析实验：验证特征漂移时簇内部结构是否改变

@@ -159,6 +159,8 @@ class Learner(BaseLearner):
                 feature_extractor=feature_extractor,
                 device=self._device,
                 use_full_task_rehearsal=self.use_full_task_rehearsal,
+                star_mode=args.get("star_mode", "rigid"),
+                star_lambda=args.get("star_lambda", 0.3),
             )
             if self.use_full_task_rehearsal:
                 logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")

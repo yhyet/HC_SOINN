@@ -1,12 +1,12 @@
 {
-    "prefix": " ",
+    "prefix": "try1",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": true,
-    "init_cls": 20,
-    "increment": 20,
+    "init_cls": 5,
+    "increment": 5,
     "model_name": "dualprompt",
     "backbone_type": "vit_base_patch16_224_dualprompt",
     "get_original_backbone": true,
@@ -45,10 +45,9 @@
 
     "use_ncm": true,
 
-    "use_feature_alignment": true,
-    "analyze_cluster_structure_drift": true,
+    "use_feature_alignment": false,
+    "analyze_cluster_structure_drift": false,
     "test_only_first_task_classes": false,
-
 
     "use_g_prompt": true,
     "g_prompt_length": 5,

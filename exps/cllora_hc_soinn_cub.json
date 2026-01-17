@@ -52,7 +52,7 @@
     "hcsoinn_soinn_ad": 20,
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.8,
-    "hcsoinn_soinn_max_iter": 1,
+    "hcsoinn_soinn_max_iter": 0,
 
     "use_feature_alignment": false,
     "use_full_task_rehearsal": false,

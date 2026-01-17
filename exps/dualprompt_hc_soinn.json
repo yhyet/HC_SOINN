@@ -1,5 +1,5 @@
 {
-    "prefix": " ",
+    "prefix": "star",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -45,8 +45,8 @@
 
     "use_ncm": true,
 
-    "use_feature_alignment": false,
-    "analyze_cluster_structure_drift": false,
+    "use_feature_alignment": true,
+    "analyze_cluster_structure_drift": true,
     "test_only_first_task_classes": false,
 
     "use_g_prompt": true,

@@ -5,8 +5,8 @@
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": true,
-    "init_cls": 20,
-    "increment": 20,
+    "init_cls": 5,
+    "increment": 5,
     "model_name": "cllora",
     "backbone_type": "vit_base_patch16_224_cllora",
     "device": ["0"],
@@ -57,6 +57,6 @@
     "use_feature_alignment": false,
     "use_full_task_rehearsal": false,
 
-    "analyze_cluster_structure_drift": true
+    "analyze_cluster_structure_drift": false
 }
 
