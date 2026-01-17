@@ -40,15 +40,17 @@ class STARAligner:
         self, 
         feats_old: np.ndarray, 
         feats_new: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, float]:
         """
-        计算刚性变换 (旋转 + 平移 + 缩放)
+        计算刚性变换 (仅平移模式：旋转和缩放已禁用)
+        
+        注意：当前实现只保留平移，旋转 R 设置为 None，缩放 s 设置为 1.0
         
         返回:
-            R: 旋转矩阵 [D, D]
+            R: 旋转矩阵 [D, D] 或 None（平移模式下为 None）
             mu_old: 旧中心 [D]
             mu_new: 新中心 [D]
-            s: 缩放因子 (float)
+            s: 缩放因子 (float，平移模式下为 1.0)
         """
         feats_old = np.asarray(feats_old, dtype=np.float32)
         feats_new = np.asarray(feats_new, dtype=np.float32)
@@ -57,9 +59,9 @@ class STARAligner:
             raise ValueError(f"Feature shape mismatch: {feats_old.shape} != {feats_new.shape}")
         
         if feats_old.shape[0] < 2:
-            # 样本太少无法计算，返回单位变换
+            # 样本太少无法计算，返回平移变换（R=None, s=1.0）
             D = feats_old.shape[1]
-            return np.eye(D, dtype=np.float32), np.zeros(D), np.zeros(D), 1.0
+            return None, np.zeros(D, dtype=np.float32), np.zeros(D, dtype=np.float32), 1.0
         
         # 1. 计算均值
         mu_old = feats_old.mean(axis=0)
@@ -69,40 +71,51 @@ class STARAligner:
         X = feats_old - mu_old
         Y = feats_new - mu_new
         
-        # 3. 计算旋转 R (SVD)
+        # 3. 计算旋转 R (SVD) - 已禁用，只保留平移
         # min || s * X @ R - Y ||
+        # 注意：为了只保留平移，将 R 设置为 None，s 设置为 1.0
         M = np.dot(X.T, Y)
         U, S, Vt = np.linalg.svd(M)
-        R = np.dot(U, Vt)
+        R_computed = np.dot(U, Vt)
         
-        if np.linalg.det(R) < 0:
+        if np.linalg.det(R_computed) < 0:
             Vt[-1, :] *= -1
-            R = np.dot(U, Vt)
+            R_computed = np.dot(U, Vt)
         
-        # 4. 计算缩放因子 s
+        # 4. 计算缩放因子 s - 已禁用，设置为 1.0
         var_old = np.sum(np.square(X))
         trace_S = np.sum(S)
         if var_old < 1e-8:
-            s = 1.0
+            s_computed = 1.0
         else:
-            s = trace_S / var_old
-            
-        # ================= [新增 Debug 信息] =================
+            s_computed = trace_S / var_old
+        
+        # ========== 只保留平移：禁用旋转和缩放 ==========
+        # 将 R 设置为 None（表示不使用旋转）
+        R = None
+        # 将 s 设置为 1.0（表示不使用缩放）
+        s = 1.0
+        
+        # ================= [Debug 信息] =================
         # 计算旧中心和新中心的欧氏距离
         shift_dist = np.linalg.norm(mu_new - mu_old)
         # 计算特征的平均模长 (用于归一化漂移量)
         avg_norm = np.mean(np.linalg.norm(feats_old, axis=1))
-        # 计算旋转角度 (弧度)
-        trace_R = np.trace(R)
-        theta = np.arccos(np.clip((trace_R - (feats_old.shape[1] - 2)) / 2, -1, 1)) # 简化的估算
+        # 计算旋转角度 (弧度) - 仅用于调试信息
+        if R_computed is not None:
+            trace_R = np.trace(R_computed)
+            theta = np.arccos(np.clip((trace_R - (feats_old.shape[1] - 2)) / 2, -1, 1))
+        else:
+            theta = 0.0
 
-        logging.info(f"[STAR DEBUG] Drift Analysis:")
+        logging.info(f"[STAR DEBUG] Drift Analysis (Translation Only Mode):")
         logging.info(f"  > Shift (Mean Move): {shift_dist:.6f} (Avg Norm: {avg_norm:.2f})")
-        logging.info(f"  > Scale Change: {s:.6f}")
-        logging.info(f"  > Rotation Angle: {theta:.6f}")
+        logging.info(f"  > Scale Change (computed but disabled): {s_computed:.6f}")
+        logging.info(f"  > Rotation Angle (computed but disabled): {theta:.6f}")
+        logging.info(f"  > Using: Translation only (R=None, s=1.0)")
         
         # 如果漂移非常小，STAR 就不会有效果
-        if shift_dist < 0.1 and abs(s - 1.0) < 0.01:
+        if shift_dist < 0.1:
              logging.warning("[STAR WARNING] Feature drift is NEGLIGIBLE! STAR will have no effect.")
         # ====================================================
         
