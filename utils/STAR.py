@@ -49,7 +49,6 @@ class STARAligner:
         # 锚点存储
         self.anchor_store: Dict[int, Dict[str, Any]] = {}
         
-        logging.info(f"[STAR] Initialized (Mode: {self.star_mode}, Chain Alignment with Scaling)")
         if self.star_mode not in {"rigid", "trajectory"}:
             logging.warning(f"[STAR] Unknown star_mode='{self.star_mode}', falling back to 'rigid'")
             self.star_mode = "rigid"
@@ -164,19 +163,6 @@ class STARAligner:
             error_after = float(np.linalg.norm(Yk - Xk_aligned, ord='fro') / np.sqrt(N))
         # ------------------------------------------------------------------------------
             
-        # ================= [新增 Debug 信息] =================
-        # 计算旧中心和新中心的欧氏距离
-        shift_dist = float(np.linalg.norm(mu_new - mu_old))
-        # 计算特征的平均模长 (用于归一化漂移量)
-        avg_norm = float(np.mean(np.linalg.norm(feats_old, axis=1)))
-        # 旋转强度：用 ||R - I||_F 作为稳定的“旋转幅度”指标（避免在高维下用不正确的 angle 估算）
-        rot_strength = float(np.linalg.norm(R - I, ord='fro') / np.sqrt(D))
-        # 有效子空间维度（可辨识维度）
-        subspace_dim = int(k)
-
-        logging.info(f"[STAR DEBUG] Drift Analysis:")
-        logging.info(f"  > Shift (Mean Move): {shift_dist:.6f} (Avg Norm: {avg_norm:.2f})")
-        logging.info(f"  > Scale Change: {s:.6f}")
         logging.info(f"  > Rotation Strength: {rot_strength:.6f} (Subspace Dim: {subspace_dim}, N={N}, D={D})")
         if error_before is not None and error_after is not None:
             logging.info(f"  > Procrustes Residual (subspace): before={error_before:.6f}, after={error_after:.6f}")
@@ -240,7 +226,6 @@ class STARAligner:
                         "feats_ref": sel_feats.copy(),
                         "mode": "trajectory_fallback",
                     }
-                    logging.info(f"[STAR] Class {cls}: No clusters found, saved {len(sel_feats)} fallback anchors.")
                     continue
 
                 # 目标：每个 cluster 选一个最相似样本，并尽量避免重复（贪心去冲突）
@@ -279,7 +264,6 @@ class STARAligner:
                     "centers_raw_ref": centers_raw_ref,
                     "ema_delta": np.zeros_like(sel_feats, dtype=np.float32),  # per-node EMA drift
                 }
-                logging.info(f"[STAR] Class {cls}: Saved {len(sel_feats)} trajectory anchors (1:1 w/ nodes).")
                 continue
 
             # -------- rigid (original) --------
@@ -306,7 +290,6 @@ class STARAligner:
                 'images': sel_imgs,
                 'feats_ref': sel_feats.copy() # 保存当前任务空间的特征作为参考
             }
-            logging.info(f"[STAR] Class {cls}: Saved {len(sel_feats)} anchors.")
 
     def align_old_classes(
         self,
@@ -423,5 +406,3 @@ class STARAligner:
                 
             except Exception as e:
                 logging.error(f"[STAR] Align failed for class {cls}: {e}")
-
-        logging.info(f"[STAR] Task {cur_task}: Aligned {aligned_cnt} classes.")

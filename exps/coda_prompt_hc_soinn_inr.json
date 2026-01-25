@@ -1,5 +1,5 @@
 {
-    "prefix": "star",
+    "prefix": "Trajectory_STAR",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -12,7 +12,7 @@
     "device": ["0"],
     "seed": [0],
 
-    "tuned_epoch": 30,
+    "tuned_epoch": 20,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,
@@ -48,7 +48,9 @@
     "use_full_task_rehearsal": false,
     "test_only_first_task_classes": false,
 
-    "analyze_cluster_structure_drift": true
+    "analyze_cluster_structure_drift": false,
+    "star_mode": "trajectory",
+    "star_lambda": 1
 }
 
 

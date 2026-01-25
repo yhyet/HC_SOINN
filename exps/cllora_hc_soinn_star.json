@@ -1,5 +1,5 @@
 {
-    "prefix": " ",
+    "prefix": "Trajectory_STAR",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -57,6 +57,8 @@
     "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
 
-    "analyze_cluster_structure_drift": true
+    "analyze_cluster_structure_drift": false,
+    "star_mode": "trajectory",
+    "star_lambda": 0.3
 }
 

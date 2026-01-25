@@ -590,11 +590,6 @@ class Learner(BaseLearner):
 
                     real_padding = w_new * scale
                     
-                    # 记录调试信息 (仅对第一个类别)
-                    if expanded_count == 0:
-                        logging.info(f"DEBUG HC-SOINN Expand: cls={cls}")
-                        logging.info(f"  mu_norm={mu_norm:.4f}, w_old_norm={w_old_norm:.4f}, scale={scale:.4f}")
-                        logging.info(f"  w_new_norm={np.linalg.norm(w_new):.4f}, real_padding_norm={np.linalg.norm(real_padding):.4f}")
                     
                     # 缓存以供 cluster 使用
                     cls_scales[cls] = scale
