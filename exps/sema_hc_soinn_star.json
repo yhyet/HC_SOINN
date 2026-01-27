@@ -1,14 +1,14 @@
 {
-    "prefix": "with_star",
-    "dataset": "imagenetr",
+    "prefix": "trajectory_STAR",
+    "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": true,
-    "init_cls": 5,
-    "increment": 5,
+    "init_cls": 10,
+    "increment": 10,
     "model_name": "sema",
-    "backbone_type": "pretrained_vit_b16_224_adapter",
+    "backbone_type": "pretrained_vit_b16_224_in21k_adapter",
     "device": ["0"],
     "seed": [1993],
     
@@ -21,7 +21,7 @@
     "vpt_type": "shallow",
     "prompt_token_num": 5,
 
-    "func_epoch": 20,
+    "func_epoch": 5,
     "rd_epoch": 20,
     "init_lr": 0.005,
     "rd_lr": 0.01,
@@ -46,13 +46,14 @@
     "hcsoinn_soinn_threshold_scale": 0.8,
     "hcsoinn_soinn_max_iter": 1,
     "hcsoinn_soinn_max_degree_for_removal": 1,
-
-    "analyze_cluster_structure_drift": true,
-
+    
+    "analyze_cluster_structure_drift": false,
     "use_feature_alignment": true,
-    "use_full_task_rehearsal": false,
     "star_mode": "trajectory",
-    "star_lambda": 1
+    "star_lambda": 1,
+    "procrustes_debug_use_testset": true,
+    "procrustes_debug_force_eval": true,
+    "procrustes_probe_start": 40,
+    "procrustes_probe_end": 49
 }
-
 
