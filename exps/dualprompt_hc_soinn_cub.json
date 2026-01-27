@@ -1,12 +1,12 @@
 {
-    "prefix": " ",
+    "prefix": "",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": false,
-    "init_cls": 20,
-    "increment": 20,
+    "init_cls": 10,
+    "increment": 10,
     "model_name": "dualprompt",
     "backbone_type": "vit_base_patch16_224_in21k_dualprompt",
     "get_original_backbone": true,
@@ -46,8 +46,10 @@
     "use_ncm": true,
 
     "use_feature_alignment": false,
-    "analyze_cluster_structure_drift": false,
-    "test_only_first_task_classes": false,
+    "analyze_cluster_structure_drift": true,
+    "star_mode": "trajectory",
+    "star_lambda": 0.3,
+
 
 
     "use_g_prompt": true,

@@ -28,5 +28,5 @@
     "prompt_param": [100, 8.0, 0.0],
     
     "test_only_first_task_classes": false,
-    "analyze_cluster_structure_drift": true
+    "analyze_cluster_structure_drift": false
 }

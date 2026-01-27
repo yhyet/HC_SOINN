@@ -14,6 +14,7 @@ from utils.toolkit import tensor2numpy
 from backbone.sema_block import SEMAModules
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
+from utils.STAR import STARAligner
 
 num_workers = 8
 
@@ -73,6 +74,35 @@ class Learner(BaseLearner):
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
+
+        # STAR 特征漂移对齐配置（支持 rigid / trajectory）
+        self.use_feature_alignment = args.get("use_feature_alignment", False)
+        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
+        self.star = None  # STARAligner（延迟初始化）
+
+        if self.use_feature_alignment and self.use_hc_soinn:
+            # 适配 SEMA：extract_vector 可能返回 dict，需要提取 "features"
+            def feature_extractor(x, class_id=None):
+                if isinstance(self._network, nn.DataParallel):
+                    feats = self._network.module.extract_vector(x)
+                else:
+                    feats = self._network.extract_vector(x)
+                if isinstance(feats, dict):
+                    feats = feats["features"]
+                return feats
+
+            self.star = STARAligner(
+                hc_soinn=self.hc_soinn,
+                feature_extractor=feature_extractor,
+                device=self._device,
+                use_full_task_rehearsal=self.use_full_task_rehearsal,
+                star_mode=args.get("star_mode", "rigid"),
+                star_lambda=args.get("star_lambda", 0.3),
+            )
+            if self.use_full_task_rehearsal:
+                logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
+            else:
+                logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
         
 
     def after_task(self):
@@ -96,16 +126,22 @@ class Learner(BaseLearner):
             else:
                 # 后续任务（Task 1, 2, ...）：计算与Task 0的Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
-        
-        # ========== 压缩 HC-SOINN（生成当前任务的节点）==========
-        # 目的：为当前任务的新类别生成 SOINN 原型节点
-        # 输入：self.hc_soinn.buffers (当前任务的训练特征)
-        # 输出：更新 self.hc_soinn.class_clusters (新增当前任务的节点)
-        if getattr(self, "use_hc_soinn", False):
-            try:
-                self.hc_soinn.compress()
-            except Exception as e:
-                logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
+
+        # STAR：为当前任务选择锚点（用于下一轮 Task 的漂移对齐）
+        # 注意：HC-SOINN compress 已前移到 _build_classifiers()（评估前），这里不再重复 compress。
+        if self.star is not None:
+            current_task_classes = set(range(self._known_classes, self._total_classes))
+            dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train",
+                mode="test",
+            )
+            self.star.select_anchors_for_current_task(
+                dataset=dataset,
+                batch_size=self.batch_size,
+                num_workers=num_workers,
+                current_task_classes=current_task_classes,
+            )
         
         self._known_classes = self._total_classes
 
@@ -362,7 +398,7 @@ class Learner(BaseLearner):
         )
         add_from_loader(current_task_loader)
         
-        # 注意：compress() 在 after_task() 中调用，这里只添加特征
+        # 注意：compress() 已前移到 _build_classifiers()（评估前），这里仅添加当前任务特征到 buffers
     
     def _eval_hc_soinn(self, loader):
         """使用 HC-SOINN 分类器进行评估"""
@@ -401,13 +437,31 @@ class Learner(BaseLearner):
         # 确保模型在正确的设备上并处于eval模式
         self._network.to(self._device)
         self._network.eval()
+
+        # 当前任务的新类别集合（用于 STAR：跳过对齐新类）
+        current_task_classes = set(range(self._known_classes, self._total_classes))
+
+        # ========== Step 0: STAR 漂移对齐（评估前对齐旧类别）==========
+        # 重要：trainer.py 的调用顺序是 incremental_train -> eval_task -> after_task
+        # 因此对齐必须发生在 eval_task 之前，否则评估用到的还是未对齐的旧原型。
+        if self.star is not None and self._cur_task > 0:
+            self.star.align_old_classes(
+                cur_task=self._cur_task,
+                current_task_classes=current_task_classes,
+            )
         
         # 1. 构建NCM分类器：计算所有已见过的任务的类均值
         self._build_ncm_classifier()
         
-        # 2. 构建 HC-SOINN bank（如果启用）
+        # 2. 构建 HC-SOINN bank（如果启用）：添加当前任务新类特征到 buffers
         if getattr(self, "use_hc_soinn", False):
             self._build_hc_soinn_bank()
+
+            # 评估前压缩：生成当前任务新类的 clusters（使 HC-SOINN 评估不再退化为 NCM）
+            try:
+                self.hc_soinn.compress()
+            except Exception as e:
+                logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
         
         logging.info("All classifiers built successfully")
     

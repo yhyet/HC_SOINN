@@ -1,5 +1,5 @@
 {
-    "prefix": "",
+    "prefix": "80",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -28,7 +28,7 @@
     "prompt_param": [100, 8.0, 0.0],
 
     "use_hc_soinn": true,
-    "hcsoinn_max_proto_per_class": 60,
+    "hcsoinn_max_proto_per_class": 80,
     "hcsoinn_alpha": 0.5,
     "hcsoinn_tau_merge": 0.2,
     "hcsoinn_tau_reject": 2.0,
@@ -42,7 +42,7 @@
 
     "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
-    "checkpoint_name": "coda_prompt_hc_soinn_cifar",
+    "checkpoint_name": "coda_prompt_hc_soinn_cifar_maxproto_80",
     "load_all_checkpoints": false,
 
 
