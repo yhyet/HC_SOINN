@@ -182,10 +182,20 @@ def _simplified_soinn_on_clusters(
     # 原始簇中心作为输入信号 (Input Signals)
     input_signals = list(zip(cluster_centers, cluster_centers_raw))
     
+    # IMPORTANT (Determinism):
+    # This refinement previously used python's global `random.shuffle(indices)`, which makes results
+    # depend on the global RNG state of each worker process. Enabling/disabling STAR (or any other
+    # feature) can consume RNG calls before `compress()`, changing the shuffle order and producing
+    # different prototypes even on Task0 (where STAR hasn't aligned anything yet).
+    #
+    # Use a local RNG with a fixed seed so refinement order is reproducible and independent of
+    # global RNG / multiprocessing for comparable experiments.
+    _local_rng = np.random.RandomState(0)
+    
     for iteration in range(max_iterations):
         indices = list(range(len(input_signals)))
         if len(indices) > 1:
-            random.shuffle(indices)
+            _local_rng.shuffle(indices)
         
         for t, idx in enumerate(indices, start=1):
             x, x_raw = input_signals[idx]
@@ -461,12 +471,6 @@ class HCSOINNClassifier:
                 centers_raw = np.array([c.center_raw.copy() for c in clusters])
                 self.cluster_snapshots[task_id][cls] = (centers_normalized, centers_raw)
                 
-                logging.info(
-                    f"[DEBUG] Saved snapshot for Class {cls} at Task {task_id}: "
-                    f"{len(clusters)} nodes, "
-                    f"center_mean_norm={np.mean(np.linalg.norm(centers_normalized, axis=1)):.6f}, "
-                    f"center_raw_mean_norm={np.mean(np.linalg.norm(centers_raw, axis=1)):.6f}"
-                )
     
     def compare_cluster_snapshots(self, task_id1: int, task_id2: int, class_list: Optional[List[int]] = None) -> None:
         """
@@ -478,9 +482,6 @@ class HCSOINNClassifier:
             class_list: List of classes to compare (None = all common classes)
         """
         if task_id1 not in self.cluster_snapshots or task_id2 not in self.cluster_snapshots:
-            logging.warning(
-                f"[DEBUG] Cannot compare: snapshots missing for task {task_id1} or {task_id2}"
-            )
             return
         
         snapshot1 = self.cluster_snapshots[task_id1]
@@ -488,11 +489,9 @@ class HCSOINNClassifier:
         
         classes_to_compare = class_list if class_list is not None else list(set(snapshot1.keys()) & set(snapshot2.keys()))
         
-        logging.info(f"[DEBUG] ========== Comparing snapshots: Task {task_id1} vs Task {task_id2} ==========")
-        
+        # Debug logging removed for performance
         for cls in sorted(classes_to_compare):
             if cls not in snapshot1 or cls not in snapshot2:
-                logging.warning(f"[DEBUG] Class {cls}: Missing in one of the snapshots")
                 continue
             
             centers_norm1, centers_raw1 = snapshot1[cls]
@@ -506,36 +505,9 @@ class HCSOINNClassifier:
                 )
                 continue
             
-            # Compute differences
+            # Compute differences (for internal use only, no logging)
             diff_norm = np.abs(centers_norm1 - centers_norm2)
             diff_raw = np.abs(centers_raw1 - centers_raw2)
-            
-            max_diff_norm = np.max(diff_norm)
-            mean_diff_norm = np.mean(diff_norm)
-            max_diff_raw = np.max(diff_raw)
-            mean_diff_raw = np.mean(diff_raw)
-            
-            # Check if identical
-            is_identical_norm = np.allclose(centers_norm1, centers_norm2, rtol=1e-9, atol=1e-9)
-            is_identical_raw = np.allclose(centers_raw1, centers_raw2, rtol=1e-9, atol=1e-9)
-            
-            logging.info(
-                f"[DEBUG] Class {cls} ({len(centers_norm1)} nodes):\n"
-                f"  Normalized: {'IDENTICAL' if is_identical_norm else 'DIFFERENT'} "
-                f"(max_diff={max_diff_norm:.2e}, mean_diff={mean_diff_norm:.2e})\n"
-                f"  Raw:        {'IDENTICAL' if is_identical_raw else 'DIFFERENT'} "
-                f"(max_diff={max_diff_raw:.2e}, mean_diff={mean_diff_raw:.2e})"
-            )
-            
-            # If different, show first few nodes for inspection
-            if not is_identical_norm or not is_identical_raw:
-                num_nodes_to_show = min(3, len(centers_norm1))
-                logging.info(f"[DEBUG] Class {cls}: Showing first {num_nodes_to_show} nodes:")
-                for i in range(num_nodes_to_show):
-                    logging.info(
-                        f"  Node {i}: norm_diff={np.linalg.norm(diff_norm[i]):.2e}, "
-                        f"raw_diff={np.linalg.norm(diff_raw[i]):.2e}"
-                    )
     
     # ------------------------------------------------------------------ #
     # 数据添加与压缩
@@ -621,17 +593,6 @@ class HCSOINNClassifier:
                 results = list(executor.map(_compress_class_worker, tasks))
             
             for cls, clusters, hierarchical_count, final_count, soinn_edges in results:
-                # DEBUG: Log old cluster statistics before replacement
-                if cls in self.class_clusters and len(self.class_clusters[cls]) > 0:
-                    old_clusters = self.class_clusters[cls]
-                    old_centers = np.array([c.center for c in old_clusters])
-                    old_centers_raw = np.array([c.center_raw for c in old_clusters])
-                    old_mean_norm = np.mean(np.linalg.norm(old_centers, axis=1))
-                    old_mean_norm_raw = np.mean(np.linalg.norm(old_centers_raw, axis=1))
-                    logging.info(
-                        f"[HC-SOINN DEBUG] Class {cls}: Replacing {len(old_clusters)} old nodes "
-                        f"(center_mean_norm={old_mean_norm:.6f}, center_raw_mean_norm={old_mean_norm_raw:.6f})"
-                    )
                 
                 self.class_clusters[cls] = clusters
                 

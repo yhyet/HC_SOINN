@@ -38,7 +38,6 @@ class ClusterStructureAnalyzer:
         batch_size: int = 128,
         num_workers: int = 8,
     ) -> None:
-        logging.info("[Cluster Structure Analysis] Saving Task 1 samples (Raw Features)...")
         
         init_cls = self.args.get("init_cls", 10)
         task1_dataset = dataset_loader()
@@ -83,16 +82,13 @@ class ClusterStructureAnalyzer:
                 'images': images_tensor,
                 'feats_task1': feats_array.copy()  # Raw features (deep copy to prevent accidental modification)
             }
-            logging.info(f"[Cluster Structure Analysis] Saved {len(images_dict[cls])} samples for class {cls} (RAW)")
         
-        logging.info(f"[Cluster Structure Analysis] Task 1 samples saved for {len(self._cluster_samples)} classes")
     
     def compute_procrustes_distances(self, cur_task: int) -> None:
         if len(self._cluster_samples) == 0:
             logging.warning("[Cluster Structure Analysis] No Task 1 samples found, skipping")
             return
         
-        logging.info(f"[Cluster Structure Analysis] Computing Procrustes distances for Task {cur_task + 1}...")
         
         if cur_task not in self._procrustes_distances:
             self._procrustes_distances[cur_task] = {}
@@ -128,14 +124,6 @@ class ClusterStructureAnalyzer:
                 # 检查是否完全相同（考虑浮点误差）
                 are_identical = np.allclose(feats_task1, feats_current, rtol=1e-8, atol=1e-8)
                 
-                logging.warning(
-                    f"[Cluster Structure Analysis DEBUG] Class {cls}: "
-                    f"feats_task1[0,0]={feat1_first_val:.8f}, "
-                    f"feats_current[0,0]={feat_curr_first_val:.8f}, "
-                    f"diff={feat_diff:.8f}, "
-                    f"mean_diff={feat_mean_diff:.8f}, "
-                    f"are_identical={are_identical}"
-                )
                 
                 if are_identical:
                     logging.error(
@@ -187,11 +175,6 @@ class ClusterStructureAnalyzer:
         
         # 【调试】检查输入是否完全相同
         are_inputs_identical = np.allclose(X1, X2, rtol=1e-8, atol=1e-8)
-        if are_inputs_identical:
-            logging.warning(
-                f"[Procrustes DEBUG] Input matrices X1 and X2 are IDENTICAL! "
-                f"This will result in Dist=0, Scale=1, Angle=π (due to det(R) correction)."
-            )
         
         # 1. 去中心化
         mu1 = X1.mean(axis=0)
@@ -199,13 +182,6 @@ class ClusterStructureAnalyzer:
         X1_centered = X1 - mu1
         X2_centered = X2 - mu2
         
-        # 【调试】检查中心化后是否相同
-        are_centered_identical = np.allclose(X1_centered, X2_centered, rtol=1e-8, atol=1e-8)
-        if are_centered_identical and not are_inputs_identical:
-            logging.warning(
-                f"[Procrustes DEBUG] After centering, X1_centered and X2_centered are IDENTICAL! "
-                f"This suggests the difference is only in the mean."
-            )
         
         # 2. 计算旋转 R
         M = np.dot(X1_centered.T, X2_centered)
@@ -216,12 +192,6 @@ class ClusterStructureAnalyzer:
             Vt[-1, :] *= -1
             R = np.dot(U, Vt)
             det_R_after = np.linalg.det(R)
-            # 【调试】如果触发了镜像修正，说明数据可能完全相同或高度对称
-            if are_centered_identical or are_inputs_identical:
-                logging.warning(
-                    f"[Procrustes DEBUG] Mirror correction triggered: det(R)={det_R_before:.6f} -> {det_R_after:.6f}. "
-                    f"This is expected when X1 and X2 are identical, resulting in Angle=π."
-                )
             
         # 3. 计算缩放 s
         # s = trace(X2_centered.T @ X1_centered @ R) / trace(X1_centered.T @ X1_centered)
@@ -243,13 +213,9 @@ class ClusterStructureAnalyzer:
         residual_norm = np.linalg.norm(residual, ord='fro')
         procrustes_dist = residual_norm / norm_factor
         
-        # 【调试】如果距离为 0，输出详细信息
+        # 如果距离为 0，跳过详细输出
         if procrustes_dist < 1e-6:
-            logging.warning(
-                f"[Procrustes DEBUG] Procrustes distance is near zero: "
-                f"residual_norm={residual_norm:.8f}, norm_factor={norm_factor:.8f}, "
-                f"dist={procrustes_dist:.8f}. This suggests X1 and X2 are nearly identical."
-            )
+            pass  # Debug logging removed
         
         # 6. 估算旋转角度 (参考)
         trace_R = np.trace(R)

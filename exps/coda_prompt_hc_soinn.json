@@ -51,6 +51,7 @@
     "star_mode": "trajectory",
     "star_lambda": 1,
 
-    "analyze_cluster_structure_drift": false
+    "analyze_cluster_structure_drift": false,
+    "enable_storage_analysis": true
 }
 

@@ -44,10 +44,10 @@
     "hcsoinn_linkage": "average",
     "hcsoinn_distance": "cosine",
     "hcsoinn_use_soinn_refinement": true,
-    "hcsoinn_soinn_ad": 100,
+    "hcsoinn_soinn_ad": 20,
     "hcsoinn_soinn_lam": 20,
-    "hcsoinn_soinn_threshold_scale": 0.2,
-    "hcsoinn_soinn_max_iter": 3,
+    "hcsoinn_soinn_threshold_scale": 0.5,
+    "hcsoinn_soinn_max_iter": 1,
     "hcsoinn_soinn_max_degree_for_removal": 0,
 
     "analyze_cluster_structure_drift": true

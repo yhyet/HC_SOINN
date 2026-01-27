@@ -16,6 +16,7 @@ from utils.soinn_classifier import SOINNClassifier
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
 from utils.STAR import STARAligner
+from utils.storage_analyzer import StorageAnalyzer
 import os
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
@@ -114,7 +115,6 @@ class Learner(BaseLearner):
         self.test_only_first_task_classes = args.get("test_only_first_task_classes", False)
         if self.test_only_first_task_classes:
             self.init_cls = args.get("init_cls", 10)
-            logging.info(f"实验模式启用：只测试第一个任务的类别 (0-{self.init_cls-1})，用于分析特征漂移影响")
         
         # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
         self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
@@ -167,8 +167,18 @@ class Learner(BaseLearner):
             else:
                 logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
         
+        # NCM分类器支持
+        self.use_ncm = args.get("use_ncm", True)  # 默认开启，保持向后兼容
+        if not self.use_ncm:
+            logging.info("NCM classifier disabled")
         # NCM分类器：初始化类均值存储
         self._class_means = None
+        
+        # 存储分析器（用于存储占用测试）
+        self.enable_storage_analysis = args.get("enable_storage_analysis", False)
+        if self.enable_storage_analysis:
+            self.storage_analyzer = StorageAnalyzer()
+            logging.info("Storage analysis enabled")
         # feature_dim 是 BaseLearner 的 @property，会从 self._network.feature_dim 获取
         # 不需要在这里设置，CodaPromptVitNet 中已经有 feature_dim 属性
 
@@ -265,8 +275,26 @@ class Learner(BaseLearner):
         
         # 6. 更新已知类别数
         self._known_classes = self._total_classes
+        
+        # 7. 存储占用分析（如果启用）
+        if self.enable_storage_analysis:
+            image_shape = (224, 224, 3)  # 默认图像尺寸，可根据数据集调整
+            # 根据数据集调整图像尺寸
+            dataset_name = self.args.get("dataset", "").lower()
+            if "cifar" in dataset_name:
+                image_shape = (32, 32, 3)
+            elif "imagenet" in dataset_name or "inr" in dataset_name:
+                image_shape = (224, 224, 3)
+            
+            storage_results = self.storage_analyzer.analyze_all(
+                network=self._network,
+                hc_soinn=getattr(self, 'hc_soinn', None) if getattr(self, 'use_hc_soinn', False) else None,
+                star_aligner=getattr(self, 'star', None) if getattr(self, 'use_feature_alignment', False) else None,
+                image_shape=image_shape
+            )
+            self.storage_analyzer.print_report(storage_results, task_id=self._cur_task)
 
-        # 6. 保存checkpoint（每个任务训练完后）
+        # 8. 保存checkpoint（每个任务训练完后）
         if self.args.get("save_checkpoint", False):
             self.save_checkpoint()
         
@@ -295,7 +323,6 @@ class Learner(BaseLearner):
             # 准备测试数据
             if self.test_only_first_task_classes:
                 test_classes = np.arange(0, self.init_cls)
-                logging.info(f"实验模式：测试数据集只包含类别 {test_classes}")
             else:
                 test_classes = np.arange(0, self._total_classes)
             test_dataset = data_manager.get_dataset(test_classes, source="test", mode="test")
@@ -316,7 +343,6 @@ class Learner(BaseLearner):
             self.data_manager = data_manager
             if self.test_only_first_task_classes:
                 test_classes = np.arange(0, self.init_cls)
-                logging.info(f"实验模式：测试数据集只包含类别 {test_classes}")
             else:
                 test_classes = np.arange(0, self._total_classes)
             test_dataset = data_manager.get_dataset(test_classes, source="test", mode="test")
@@ -380,7 +406,6 @@ class Learner(BaseLearner):
         包括：NCM分类器、KNN bank（普通模式或upperbound模式）
         无论是正常训练还是加载checkpoint，都在这里统一构建
         """
-        logging.info(f"Building classifiers for task {self._cur_task} (total classes: {self._total_classes})")
         
         # 确保模型在正确的设备上并处于eval模式
         self._network.to(self._device)
@@ -401,8 +426,9 @@ class Learner(BaseLearner):
                 current_task_classes=current_task_classes
             )
         
-        # 1. 构建NCM分类器：计算所有已见过的任务的类均值
-        self._build_ncm_classifier()
+        # 1. 构建NCM分类器：计算所有已见过的任务的类均值（如果启用）
+        if getattr(self, "use_ncm", True):
+            self._build_ncm_classifier()
         
         # 2. 构建KNN bank
         if getattr(self, "use_knn", False):
@@ -419,7 +445,6 @@ class Learner(BaseLearner):
         elif getattr(self, "use_soinn", False):
             self._build_soinn_bank()
         
-        logging.info("All classifiers built successfully")
     
     def _build_ncm_classifier(self):
         """
@@ -432,7 +457,6 @@ class Learner(BaseLearner):
         # 实验模式：只构建第一个任务的类别
         if self.test_only_first_task_classes:
             ncm_classes = self.init_cls
-            logging.info(f"实验模式：NCM分类器只构建第一个任务的类别 (0-{ncm_classes-1})")
         else:
             ncm_classes = self._total_classes
         
@@ -575,7 +599,6 @@ class Learner(BaseLearner):
         
         if knn_bank_empty:
             # 首次任务或加载checkpoint后：需要计算所有已见过的任务的features
-            logging.info(f"Building KNN bank: computing all seen classes (0-{self._total_classes-1}) [first task or after checkpoint load]")
             all_train_dataset = self.data_manager.get_dataset(
                 np.arange(0, self._total_classes), source="train", mode="test"
             )
@@ -615,7 +638,6 @@ class Learner(BaseLearner):
             logging.info(f"KNN bank built: computed features for {self._total_classes} classes")
         else:
             # 正常训练：累积存储机制 - 保留之前的features，只添加当前任务新类别的features
-            logging.info(f"Building KNN bank: preserving previous features, adding new classes ({self._known_classes}-{self._total_classes-1})")
             
             # 注意：不清空KNN bank，保留之前的features（累积存储）
             
@@ -675,7 +697,6 @@ class Learner(BaseLearner):
         不使用累积存储，每次都重新提取所有数据（当前+过往）的特征
         使用最新的模型特征，避免特征漂移
         """
-        logging.info(f"Rebuilding KNN bank in upperbound mode: using all seen classes (0-{self._total_classes-1}) with latest model")
         
         # 清空KNN bank（不使用累积存储）
         self.knn.clear()
@@ -759,7 +780,6 @@ class Learner(BaseLearner):
         
         if soinn_bank_empty:
             # 首次任务或加载checkpoint后：需要计算所有已见过的任务的features
-            logging.info(f"Building SOINN bank: computing all seen classes (0-{self._total_classes-1}) [first task or after checkpoint load]")
             all_train_dataset = self.data_manager.get_dataset(
                 np.arange(0, self._total_classes), source="train", mode="test"
             )
@@ -785,7 +805,6 @@ class Learner(BaseLearner):
             logging.info(f"SOINN prototypes per class: {proto_info}")
         else:
             # 正常训练：累积存储机制 - 保留之前的features，只添加当前任务新类别的features
-            logging.info(f"Building SOINN bank: preserving previous prototypes, adding new classes ({self._known_classes}-{self._total_classes-1})")
             
             # 注意：不清空SOINN bank，保留之前的features（累积存储）
             
@@ -841,7 +860,6 @@ class Learner(BaseLearner):
             self.hc_soinn.add_features(feats_np, lbs_np)
 
         # 类增量学习：每个任务只使用当前任务的新类别训练数据
-        logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
         current_task_dataset = self.data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes), source="train", mode="test"
         )
@@ -1116,7 +1134,6 @@ class Learner(BaseLearner):
         """
         # 如果启用了knn_upperbound，在评估前重新构建KNN bank（使用最新的模型特征）
         if getattr(self, "use_knn", False) and getattr(self, "knn_upperbound", False):
-            logging.info("Rebuilding KNN bank in upperbound mode at eval time (using all data with latest model)")
             self._build_knn_bank_upperbound_at_eval()
         
         results = {}
@@ -1138,44 +1155,14 @@ class Learner(BaseLearner):
         
         # 3. 使用 HC-SOINN / SOINN 分类器评估（互斥）
         if getattr(self, "use_hc_soinn", False):
-            # DEBUG: Save Inference Snapshot to verify if nodes are truly frozen during inference
-            # 按任务记录调试信息：
-            # - class 0-9: 在 Task 2 记录
-            # - class 10-19: 在 Task 3 记录
-            # - class 20-29: 在 Task 4 记录
-            # - 以此类推：class (k*10) 到 (k*10+9) 在 Task (k+2) 记录
-            
-            # 计算当前任务应该记录哪些类组的调试信息
-            # Task 2 记录 class 0-9, Task 3 记录 class 10-19, Task 4 记录 class 20-29, ...
-            if self._cur_task >= 2:
-                # 当前任务应该记录的类组：class (cur_task-2)*10 到 (cur_task-2)*10+9
-                class_group_start = (self._cur_task - 2) * 10
-                class_group_end = class_group_start + 10
-                
-                # 确保不超过总类别数
-                if class_group_start < self._total_classes:
-                    class_group_end = min(class_group_end, self._total_classes)
-                    classes_to_log = list(range(class_group_start, class_group_end))
-                    
-                    # 使用 task_id + 1000 来区分对齐快照和推理快照
-                    inference_task_id = self._cur_task + 1000
-                    self.hc_soinn.save_cluster_snapshot(inference_task_id, classes_to_log)
-                    logging.info(f"[DEBUG] Saved INFERENCE snapshot for Task {self._cur_task} (classes {class_group_start}-{class_group_end-1})")
-                    
-                    # 与上一个任务的快照比较
-                    if self._cur_task >= 3:
-                        prev_inference_task_id = (self._cur_task - 1) + 1000
-                        logging.info(f"[DEBUG] ========== Comparing INFERENCE snapshots: Task {self._cur_task - 1} vs Task {self._cur_task} (classes {class_group_start}-{class_group_end-1}) ==========")
-                        self.hc_soinn.compare_cluster_snapshots(prev_inference_task_id, inference_task_id, classes_to_log)
-
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
         elif getattr(self, "use_soinn", False):
             y_pred_soinn, y_true_soinn = self._eval_soinn(self.test_loader)
             results["soinn"] = self._evaluate(y_pred_soinn, y_true_soinn)
         
-        # 4. 使用NCM分类器评估（如果已计算类均值）
-        if hasattr(self, "_class_means") and self._class_means is not None:
+        # 4. 使用NCM分类器评估（如果启用且已计算类均值）
+        if getattr(self, "use_ncm", True) and hasattr(self, "_class_means") and self._class_means is not None:
             y_pred_ncm, y_true_ncm = self._eval_ncm_fc(self.test_loader)
             results["ncm"] = self._evaluate(y_pred_ncm, y_true_ncm)
         

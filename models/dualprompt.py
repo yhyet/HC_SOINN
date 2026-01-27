@@ -141,7 +141,6 @@ class Learner(BaseLearner):
     def after_task(self):
         # STAR: 为当前任务选择锚点（用于下一轮漂移对齐）
         if self.star is not None:
-            logging.info(f"[STAR] Selecting anchors for task {self._cur_task}")
             # 获取当前任务的训练数据集
             dataset = self.data_manager.get_dataset(
                 np.arange(self._known_classes, self._total_classes),
@@ -392,7 +391,6 @@ class Learner(BaseLearner):
         # ========== Step 0: STAR 特征漂移对齐 (在评估前对齐旧类别) ==========
         if self.star is not None and self._cur_task > 0:
             current_task_classes = set(range(self._known_classes, self._total_classes))
-            logging.info(f"[STAR] Aligning old classes before evaluation (task {self._cur_task})")
             self.star.align_old_classes(
                 cur_task=self._cur_task,
                 current_task_classes=current_task_classes
@@ -509,9 +507,6 @@ class Learner(BaseLearner):
             all_feats = np.concatenate(feats, axis=0)
             all_lbs = np.concatenate(lbs, axis=0)
             
-            # DEBUG: 打印构建时的特征统计
-            norms = np.linalg.norm(all_feats, axis=1)
-            logging.info(f"[DEBUG_BUILD] Input Feats: shape={all_feats.shape}, norm_mean={norms.mean():.4f}, norm_std={norms.std():.4f}, max={norms.max():.4f}, min={norms.min():.4f}")
             
             self.hc_soinn.add_features(all_feats, all_lbs)
             self.hc_soinn.compress()
@@ -534,23 +529,9 @@ class Learner(BaseLearner):
     def _eval_hc_soinn(self, loader):
         self._network.eval()
         
-        # DEBUG: Check Consistency between NCM and HC-SOINN centers
-        if self._class_means is not None and len(self.hc_soinn.class_mu) > 0:
-            diffs = []
-            for cls_id, mu in self.hc_soinn.class_mu.items():
-                if cls_id < len(self._class_means):
-                    # Ensure NCM mean is normalized for comparison
-                    ncm_mean = self._class_means[cls_id]
-                    ncm_mean_norm = ncm_mean / (np.linalg.norm(ncm_mean) + 1e-8)
-                    diff = np.linalg.norm(mu - ncm_mean_norm)
-                    diffs.append(diff)
-            if diffs:
-                logging.info(f"[DEBUG_EVAL] NCM vs HC-SOINN Centers Diff: Mean={np.mean(diffs):.6f}, Max={np.max(diffs):.6f}")
 
         y_pred, y_true = [], []
         feature_fn = self._get_soinn_feature_fn()
-        
-        debug_printed = False
         
         with torch.no_grad():
             for _, (_, inputs, targets) in enumerate(loader):
@@ -560,12 +541,6 @@ class Learner(BaseLearner):
                 # 手动做一次L2归一化
                 feats = F.normalize(feats, p=2, dim=1)
                 feats_np = feats.cpu().numpy()
-                
-                # DEBUG: 打印评估时的特征统计 (只打一次)
-                if not debug_printed:
-                    norms = np.linalg.norm(feats_np, axis=1)
-                    logging.info(f"[DEBUG_EVAL] Input Feats: shape={feats_np.shape}, norm_mean={norms.mean():.4f}, norm_std={norms.std():.4f}")
-                    debug_printed = True
 
                 topk_pred = self.hc_soinn.predict_topk(feats_np, self.topk, self._total_classes, device=self._device)
                 y_pred.append(topk_pred)

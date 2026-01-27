@@ -1,5 +1,5 @@
 {
-    "prefix": "",
+    "prefix": "kac_50epoch",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -12,7 +12,7 @@
     "device": ["0"],
     "seed": [0],
     
-    "tuned_epoch": 20,
+    "tuned_epoch": 50,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,

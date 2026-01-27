@@ -1,25 +1,25 @@
 {
-    "prefix": " ",
-    "dataset": "cub",
+    "prefix": "Trajectory_STAR",
+    "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
-    "shuffle": false,
-    "init_cls": 10,
-    "increment": 10,
+    "shuffle": true,
+    "init_cls": 5,
+    "increment": 5,
     "model_name": "dualprompt",
-    "backbone_type": "vit_base_patch16_224_in21k_dualprompt",
+    "backbone_type": "vit_base_patch16_224_dualprompt",
     "get_original_backbone": true,
     "device": ["0"],
     "seed": [1993],
     
-    "tuned_epoch": 20,
+    "tuned_epoch": 10,
     "init_lr": 0.001,
-    "batch_size": 128,
+    "batch_size": 24,
     "weight_decay": 0,
     "min_lr": 1e-5,
     "optimizer": "adam",
-    "scheduler": "cosine",
+    "scheduler": "constant",
     "reinit_optimizer": true,
 
     "global_pool": "token",
@@ -30,13 +30,26 @@
     "drop": 0.0,
     "drop_path": 0.0,
 
-    "use_kac": true,
-    "kac_config": {
-        "grid_min": -2.0,
-        "grid_max": 2.0,
-        "num_grids": 16,
-        "spline_weight_init_scale": 0.1
-    },
+    "use_hc_soinn": true,
+    "hcsoinn_max_proto_per_class": 60,
+    "hcsoinn_alpha": 0.5,
+    "hcsoinn_tau_merge": 0.2,
+    "hcsoinn_tau_reject": 2.0,
+    "hcsoinn_linkage": "average",
+    "hcsoinn_distance": "cosine",
+    "hcsoinn_use_soinn_refinement": true,
+    "hcsoinn_soinn_ad": 20,
+    "hcsoinn_soinn_lam": 20,
+    "hcsoinn_soinn_threshold_scale": 0.8,
+    "hcsoinn_soinn_max_iter": 1,
+
+    "use_ncm": true,
+
+    "use_feature_alignment": true,
+    "analyze_cluster_structure_drift": false,
+    "test_only_first_task_classes": false,
+    "star_mode": "trajectory",
+    "star_lambda": 1,
 
     "use_g_prompt": true,
     "g_prompt_length": 5,
@@ -64,5 +77,3 @@
     "pull_constraint_coeff": 0.1,
     "same_key_value": false
 }
-
-

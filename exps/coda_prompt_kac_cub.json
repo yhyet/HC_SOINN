@@ -1,5 +1,5 @@
 {
-    "prefix": "KAC_new",
+    "prefix": "KAC_21k",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -46,8 +46,5 @@
 
     "analyze_cluster_structure_drift": false
 }
-
-
-
 
 

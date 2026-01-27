@@ -1,5 +1,5 @@
 {
-    "prefix": "try1",
+    "prefix": "no_STAR",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -47,9 +47,9 @@
 
     "use_feature_alignment": true,
     "analyze_cluster_structure_drift": false,
+    "test_only_first_task_classes": false,
     "star_mode": "trajectory",
     "star_lambda": 0.3,
-
 
     "use_g_prompt": true,
     "g_prompt_length": 5,

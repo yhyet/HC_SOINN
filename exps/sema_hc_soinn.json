@@ -1,5 +1,5 @@
 {
-    "prefix": "no_star",
+    "prefix": "",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -48,6 +48,10 @@
     "hcsoinn_soinn_max_degree_for_removal": 1,
     
     "analyze_cluster_structure_drift": true,
-    "use_feature_alignment": false
+    "use_feature_alignment": false,
+    "procrustes_debug_use_testset": true,
+    "procrustes_debug_force_eval": true,
+    "procrustes_probe_start": 40,
+    "procrustes_probe_end": 49
 }
 
