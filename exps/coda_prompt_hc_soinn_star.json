@@ -1,5 +1,5 @@
 {
-    "prefix": "Trajectory_STAR",
+    "prefix": "Trajectory_STAR_tsne",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -53,6 +53,8 @@
     "analyze_cluster_structure_drift": false,
     "star_mode": "trajectory",
     "star_lambda": 1,
-    "enable_storage_analysis": true
+    "enable_storage_analysis": true,
+    "use_ncm": false,
+    "visualize_tsne": true
 }
 

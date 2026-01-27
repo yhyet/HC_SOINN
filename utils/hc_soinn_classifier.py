@@ -408,6 +408,87 @@ class HCSOINNClassifier:
         # 任务内缓存特征（仅在 compress 时聚类）
         self.buffers: Dict[int, List[np.ndarray]] = {}
 
+        # ------------------------------------------------------------------ #
+        # Inference acceleration cache (built lazily on first predict_topk call)
+        # ------------------------------------------------------------------ #
+        # Cache is invalidated whenever class centers / prototypes change (compress, alignment, etc.)
+        self._predict_cache_dirty: bool = True
+        self._predict_cache: Dict[str, object] = {}
+
+    # ------------------------------------------------------------------ #
+    # Cache helpers
+    # ------------------------------------------------------------------ #
+    def invalidate_cache(self) -> None:
+        """Invalidate cached tensors used by predict_topk(). Safe to call often."""
+        self._predict_cache_dirty = True
+        self._predict_cache.clear()
+
+    def _ensure_predict_cache(
+        self,
+        device: torch.device,
+        query_dim: int,
+        valid_classes: List[int],
+    ) -> None:
+        """
+        Build/cache prototype tensors on the target device to avoid per-call numpy concat and H2D copies.
+        Cache key depends on: device, query_dim, and the ordered valid_classes list.
+        """
+        device_key = str(device)
+        classes_key = tuple(int(c) for c in valid_classes)
+
+        if (
+            (not self._predict_cache_dirty)
+            and self._predict_cache.get("device_key") == device_key
+            and self._predict_cache.get("query_dim") == int(query_dim)
+            and self._predict_cache.get("classes_key") == classes_key
+        ):
+            return
+
+        # ---------- NCM centers (already normalized) ----------
+        ncm_centers_np = np.stack([self.class_mu[cls] for cls in valid_classes]).astype(np.float32, copy=False)
+        ncm_centers_t = torch.from_numpy(ncm_centers_np).to(device=device, dtype=torch.float32)
+
+        # ---------- Prototypes (sub-clusters; fallback to NCM if empty) ----------
+        all_protos: List[np.ndarray] = []
+        proto_labels: List[int] = []       # original class id per proto
+        proto_class_index: List[int] = []  # index in valid_classes per proto (0..C-1)
+
+        for class_index, cls in enumerate(valid_classes):
+            clusters = self.class_clusters.get(cls, [])
+            if clusters:
+                cluster_dims = [c.center.shape[0] for c in clusters]
+                if all(dim == query_dim for dim in cluster_dims):
+                    cls_protos = np.stack([c.center for c in clusters]).astype(np.float32, copy=False)
+                    all_protos.append(cls_protos)
+                    n_p = int(cls_protos.shape[0])
+                    proto_labels.extend([int(cls)] * n_p)
+                    proto_class_index.extend([int(class_index)] * n_p)
+                    continue
+
+            # Fallback: at least one proto per class (use NCM center)
+            mu = self.class_mu[cls].astype(np.float32, copy=False)
+            all_protos.append(mu[np.newaxis, :])
+            proto_labels.append(int(cls))
+            proto_class_index.append(int(class_index))
+
+        all_protos_np = np.concatenate(all_protos, axis=0).astype(np.float32, copy=False)
+        all_protos_t = torch.from_numpy(all_protos_np).to(device=device, dtype=torch.float32)
+        proto_labels_t = torch.tensor(proto_labels, device=device, dtype=torch.long)
+        proto_class_index_t = torch.tensor(proto_class_index, device=device, dtype=torch.long)
+
+        # Prototypes and NCM centers are expected to already be L2-normalized.
+        # We keep them as-is to avoid extra normalize() cost per call.
+        self._predict_cache = {
+            "device_key": device_key,
+            "query_dim": int(query_dim),
+            "classes_key": classes_key,
+            "ncm_centers_t": ncm_centers_t,               # [C, D]
+            "all_protos_t": all_protos_t,                 # [M, D]
+            "proto_labels_t": proto_labels_t,             # [M]
+            "proto_class_index_t": proto_class_index_t,   # [M] in 0..C-1
+        }
+        self._predict_cache_dirty = False
+
     # ------------------------------------------------------------------ #
     # STAR: Force Freeze Methods
     # ------------------------------------------------------------------ #
@@ -552,6 +633,9 @@ class HCSOINNClassifier:
                 self.class_mu_raw_original[cls] = cls_mean_raw.copy()
                 self.class_mu_original[cls] = _normalize(cls_mean_raw)
 
+        # class_mu / buffers updated => invalidate inference cache
+        self.invalidate_cache()
+
     def compress(self) -> None:
         """
         周期性压缩（通常在每个 task 结束时调用）：
@@ -638,6 +722,9 @@ class HCSOINNClassifier:
         else:
             logging.info("[HC-SOINN] No buffer to compress.")
 
+        # Prototypes replaced => invalidate inference cache
+        self.invalidate_cache()
+
     # ------------------------------------------------------------------ #
     # 预测 (GPU 加速版)
     # ------------------------------------------------------------------ #
@@ -685,7 +772,10 @@ class HCSOINNClassifier:
         if not valid_classes:
             return np.zeros((query_features.shape[0], topk), dtype=np.int64)
 
-        query_t = torch.from_numpy(query_features).float().to(device)
+        query_t = torch.from_numpy(query_features).to(device=device, dtype=torch.float32)
+
+        # Build/reuse cached prototype tensors on the target device
+        self._ensure_predict_cache(device=device, query_dim=query_dim, valid_classes=valid_classes)
         
         # -----------------------------------------------------------
         # 辅助函数：计算距离 (支持 EASE Reweighting 或 标准 Cosine)
@@ -769,16 +859,15 @@ class HCSOINNClassifier:
                 
             else:
                 # 标准 Cosine Distance
-                p_norm = torch.nn.functional.normalize(protos_t, p=2, dim=1)
                 q_norm = torch.nn.functional.normalize(query_t, p=2, dim=1)
-                sim = torch.mm(q_norm, p_norm.t())
+                # protos_t are expected to already be normalized (stored as such in HC-SOINN)
+                sim = torch.mm(q_norm, protos_t.t())
                 return 1.0 - sim
 
         # -----------------------------------------------------------
         # 1. 计算 NCM 距离
         # -----------------------------------------------------------
-        ncm_centers_np = np.stack([self.class_mu[cls] for cls in valid_classes])
-        ncm_centers_t = torch.from_numpy(ncm_centers_np).float().to(device)
+        ncm_centers_t = self._predict_cache["ncm_centers_t"]
         
         # NCM 不需要 label 参数，因为顺序对应 valid_classes
         dist_ncm = compute_distance(ncm_centers_t)  # [N, C]
@@ -786,30 +875,23 @@ class HCSOINNClassifier:
         # -----------------------------------------------------------
         # 2. 计算 Sub-Cluster 距离
         # -----------------------------------------------------------
-        all_protos = []
-        proto_labels = []
-        
-        for cls in valid_classes:
-            clusters = self.class_clusters.get(cls, [])
-            if clusters:
-                cluster_dims = [c.center.shape[0] for c in clusters]
-                if all(dim == query_dim for dim in cluster_dims):
-                    cls_protos = np.stack([c.center for c in clusters])
-                    all_protos.append(cls_protos)
-                    proto_labels.extend([cls] * len(clusters))
-            else:
-                # Fallback to class center if no clusters
-                all_protos.append(self.class_mu[cls][np.newaxis, :])
-                proto_labels.append(cls)
-        
-        if all_protos:
-            all_protos_np = np.concatenate(all_protos, axis=0)
-            all_protos_t = torch.from_numpy(all_protos_np).float().to(device)
-            proto_labels_t = torch.tensor(proto_labels, device=device)
-            
-            dist_proto_all = compute_distance(all_protos_t, proto_labels_t) # [N, M_total]
-            
-            dist_sub = torch.full_like(dist_ncm, float('inf'))
+        all_protos_t = self._predict_cache["all_protos_t"]
+        proto_labels_t = self._predict_cache["proto_labels_t"]
+        proto_class_index_t = self._predict_cache["proto_class_index_t"]
+
+        dist_proto_all = compute_distance(all_protos_t, proto_labels_t)  # [N, M]
+
+        # Fast per-class min over prototypes: dist_sub[n, c] = min_{m in class c} dist_proto_all[n, m]
+        # This replaces the Python loop with boolean masks.
+        C = len(valid_classes)
+        N = dist_proto_all.shape[0]
+        dist_sub = torch.full((N, C), float("inf"), device=device, dtype=dist_proto_all.dtype)
+
+        if hasattr(dist_sub, "scatter_reduce_"):
+            idx = proto_class_index_t.view(1, -1).expand(N, -1)  # [N, M]
+            dist_sub.scatter_reduce_(1, idx, dist_proto_all, reduce="amin", include_self=True)
+        else:
+            # Fallback for older torch: keep previous behavior (slower)
             for i, cls in enumerate(valid_classes):
                 mask = (proto_labels_t == cls)
                 if mask.any():
@@ -817,8 +899,6 @@ class HCSOINNClassifier:
                     dist_sub[:, i] = min_d
                 else:
                     dist_sub[:, i] = dist_ncm[:, i]
-        else:
-            dist_sub = dist_ncm
         
         # 融合分数
         # score = alpha * d_ncm + (1 - alpha) * d_sub
@@ -942,6 +1022,9 @@ class HCSOINNClassifier:
             if np.linalg.norm(new_mu_raw) > 1e-9:
                 self.class_mu_raw[cls] = new_mu_raw
                 self.class_mu[cls] = _normalize(new_mu_raw)
+
+        # Nodes / class centers updated => invalidate inference cache
+        self.invalidate_cache()
                 
     # ------------------------------------------------------------------ #
     # 工具函数

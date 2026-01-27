@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from models.base import BaseLearner
 from utils.inc_net import FOSTERNet
 from utils.toolkit import count_parameters, target2onehot, tensor2numpy
+from utils.hc_soinn_classifier import HCSOINNClassifier
 
 # Please refer to https://github.com/G-U-N/ECCV22-FOSTER for the full source code to reproduce foster.
 
@@ -29,6 +30,26 @@ class Learner(BaseLearner):
         self.lambda_okd = args["lambda_okd"]
         self.wa_value = args["wa_value"]
         self.oofc = args["oofc"].lower()
+
+        # ---------------- HC-SOINN plugin (optional, eval-only head) ----------------
+        self.use_hc_soinn = args.get("use_hc_soinn", False)
+        self.hc_soinn = None
+        if self.use_hc_soinn:
+            logging.info("[FOSTER] HC-SOINN enabled (evaluation head)")
+            self.hc_soinn = HCSOINNClassifier(
+                max_prototypes_per_class=args.get("hcsoinn_max_proto_per_class", 20),
+                alpha=args.get("hcsoinn_alpha", 0.5),
+                tau_merge=args.get("hcsoinn_tau_merge", 0.2),
+                tau_reject=args.get("hcsoinn_tau_reject", 2.0),
+                linkage_method=args.get("hcsoinn_linkage", "average"),
+                distance_metric=args.get("hcsoinn_distance", "cosine"),
+                use_soinn_refinement=args.get("hcsoinn_use_soinn_refinement", True),
+                soinn_ad=args.get("hcsoinn_soinn_ad", 20),
+                soinn_lam=args.get("hcsoinn_soinn_lam", 20),
+                soinn_threshold_scale=args.get("hcsoinn_soinn_threshold_scale", 0.5),
+                soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
+                soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
+            )
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -86,8 +107,139 @@ class Learner(BaseLearner):
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
         self._train(self.train_loader, self.test_loader)
         self.build_rehearsal_memory(data_manager, self.samples_per_class)
+
+        # Build/update HC-SOINN bank after finishing this task (class-incremental: only current task classes)
+        if getattr(self, "use_hc_soinn", False) and self.hc_soinn is not None:
+            try:
+                self._build_hc_soinn_bank()
+            except Exception as e:
+                logging.error(f"[FOSTER] HC-SOINN build/compress error: {e}", exc_info=True)
+
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
+
+    # ------------------------------------------------------------------ #
+    # HC-SOINN helpers (feature extraction, bank build, eval)
+    # ------------------------------------------------------------------ #
+    def _get_eval_model(self):
+        """
+        Prefer the compressed student net (SNet) for evaluation when available.
+        This matches FOSTER's intended workflow: boosting -> compression -> evaluate SNet.
+        """
+        return self._snet if self._snet is not None else self._network
+
+    def _get_hc_soinn_feature_fn(self):
+        """
+        Return a feature extractor for HC-SOINN.
+        We use the *last backbone* feature block only (fixed dim = out_dim) so the feature dimension
+        stays constant across tasks even though FOSTER's full FC uses concatenated features.
+        """
+        model = self._get_eval_model()
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+
+        out_dim = getattr(model, "out_dim", None)
+
+        def _fn(x):
+            feats = model.extract_vector(x)
+            # Keep only the newest backbone feature chunk to ensure consistent dimension across tasks
+            if out_dim is not None and feats.shape[1] >= out_dim:
+                feats = feats[:, -out_dim:]
+            return feats
+
+        return _fn
+
+    def _build_hc_soinn_bank(self):
+        """
+        Build/update HC-SOINN prototypes using *current task* training data only (new classes),
+        similar to coda_prompt._build_hc_soinn_bank().
+        """
+        feature_fn = self._get_hc_soinn_feature_fn()
+        eval_model = self._get_eval_model()
+        eval_model.eval()
+
+        current_task_dataset = self.data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes), source="train", mode="test"
+        )
+        current_task_loader = DataLoader(
+            current_task_dataset,
+            batch_size=self.args["batch_size"],
+            shuffle=False,
+            drop_last=False,
+            num_workers=self.args["num_workers"],
+        )
+
+        feats_list, lbs_list = [], []
+        with torch.no_grad():
+            for _, inputs, targets in current_task_loader:
+                inputs = inputs.to(self._device)
+                feats = feature_fn(inputs)
+                feats = feats.detach().cpu()
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                feats_list.append(feats.numpy())
+                lbs_list.append(targets.numpy())
+
+        if len(feats_list) == 0:
+            return
+
+        feats_np = np.concatenate(feats_list, axis=0)
+        lbs_np = np.concatenate(lbs_list, axis=0)
+        self.hc_soinn.add_features(feats_np, lbs_np)
+        self.hc_soinn.compress()
+
+    def _eval_fc(self, loader):
+        """Evaluate using the FOSTER FC logits (prefer SNet when available)."""
+        model = self._get_eval_model()
+        model.eval()
+        y_pred, y_true = [], []
+        for _, (_, inputs, targets) in enumerate(loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                outputs = model(inputs)["logits"]
+            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+            y_pred.append(predicts.cpu().numpy())
+            y_true.append(targets.cpu().numpy())
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def _eval_hc_soinn(self, loader):
+        """Evaluate using HC-SOINN prototypes (feature space: last backbone chunk)."""
+        model = self._get_eval_model()
+        model.eval()
+        y_pred, y_true = [], []
+        feature_fn = self._get_hc_soinn_feature_fn()
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                feats = feature_fn(inputs).detach().cpu()
+                if len(feats.shape) == 1:
+                    feats = feats.reshape(1, -1)
+                feats_np = feats.numpy()
+                topk_pred = self.hc_soinn.predict_topk(
+                    feats_np, self.topk, self._total_classes, device=self._device
+                )
+                y_pred.append(topk_pred)
+                y_true.append(targets.cpu().numpy())
+
+        if len(y_pred) == 0:
+            logging.warning("[FOSTER] No predictions generated from HC-SOINN evaluation")
+            return np.array([]), np.array([])
+
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def eval_task(self):
+        """
+        Return a dict of evaluation results compatible with trainer.py (fc + optional hc_soinn).
+        """
+        results = {}
+        y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
+        results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
+
+        if getattr(self, "use_hc_soinn", False) and self.hc_soinn is not None:
+            y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
+            results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
+
+        return results
 
     def train(self):
         self._network_module_ptr.train()

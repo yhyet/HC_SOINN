@@ -396,6 +396,10 @@ class STARAligner:
                         [c.center_raw for c in clusters], axis=0
                     ).astype(np.float32, copy=False)
 
+                    # HC-SOINN nodes/NCM were updated in-place => invalidate inference cache if present
+                    if hasattr(self.hc_soinn, "invalidate_cache"):
+                        self.hc_soinn.invalidate_cache()
+
                     aligned_cnt += 1
                 else:
                     # -------- Rigid STAR (default) --------
