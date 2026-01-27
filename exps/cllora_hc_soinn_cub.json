@@ -1,5 +1,5 @@
 {
-    "prefix": " ",
+    "prefix": "no_star",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -43,6 +43,7 @@
 
     "use_hc_soinn": true,
     "hcsoinn_max_proto_per_class": 60,
+    "hcsoinn_feature_mode": "diagonal",
     "hcsoinn_alpha": 0.5,
     "hcsoinn_tau_merge": 0.2,
     "hcsoinn_tau_reject": 2.0,

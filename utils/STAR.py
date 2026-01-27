@@ -187,7 +187,12 @@ class STARAligner:
         with torch.no_grad():
             for _, inputs, targets in loader:
                 inputs = inputs.to(self.device)
-                feats = self.feature_extractor(inputs)
+                # Support for class-conditional feature extractors (e.g., CL-LoRA diagonal segment)
+                # - If feature_extractor supports class_id, we pass the batch labels so it can return per-sample features
+                try:
+                    feats = self.feature_extractor(inputs, class_id=targets)
+                except TypeError:
+                    feats = self.feature_extractor(inputs)
                 if isinstance(feats, tuple): feats = feats[0]
                 
                 all_feats.append(feats.detach().cpu().numpy())
