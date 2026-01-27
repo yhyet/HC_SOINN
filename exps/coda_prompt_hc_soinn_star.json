@@ -42,15 +42,12 @@
 
     "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
-    "checkpoint_name": "coda_prompt_hc_soinn_star_cifar",
+    "checkpoint_name": "coda_prompt_hc_soinn_cifar",
     "load_all_checkpoints": false,
 
 
     "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
-    "test_only_first_task_classes": false,
-
-    "analyze_cluster_structure_drift": false,
     "star_mode": "trajectory",
     "star_lambda": 1,
     "enable_storage_analysis": true,

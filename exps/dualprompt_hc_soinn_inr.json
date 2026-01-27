@@ -45,7 +45,7 @@
 
     "use_ncm": true,
 
-    "use_feature_alignment": false,
+    "use_feature_alignment": true,
     "analyze_cluster_structure_drift": false,
     "test_only_first_task_classes": false,
     "star_mode": "trajectory",

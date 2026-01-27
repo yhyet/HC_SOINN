@@ -1,5 +1,5 @@
 {
-    "prefix": "hcsoinn_star",
+    "prefix": "Trajectory_STAR",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -12,7 +12,7 @@
     "device": ["0"],
     "seed": [0],
     
-    "tuned_epoch": 5,
+    "tuned_epoch": 50,
     "init_lr": 0.001,
     "batch_size": 128,
     "weight_decay": 0,
@@ -49,8 +49,9 @@
     "checkpoint_name": "coda_prompt_hc_soinn_star_cub",
     "load_all_checkpoints": false,
 
-    "test_only_first_task_classes": false,
+    "star_mode": "trajectory",
+    "star_lambda": 0.3,
 
-    "analyze_cluster_structure_drift": true
+    "analyze_cluster_structure_drift": false
 }
 

@@ -48,11 +48,10 @@
 
     "use_feature_alignment": false,
     "use_full_task_rehearsal": false,
-    "test_only_first_task_classes": false,
+    "star_mode": "trajectory",
+    "star_lambda": 1,
 
     "analyze_cluster_structure_drift": false,
-    "star_mode": "trajectory",
-    "star_lambda": 0.3,
     "enable_storage_analysis": true,
     "use_ncm": false,
     "visualize_tsne": true
