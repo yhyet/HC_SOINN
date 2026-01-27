@@ -34,7 +34,7 @@
     "kac_config": {
         "grid_min": -2.0,
         "grid_max": 2.0,
-        "num_grids": 16,
+        "num_grids": 12,
         "spline_weight_init_scale": 0.1
     },
 

@@ -37,8 +37,8 @@
     "adapter_num": -1,
 
     "use_hc_soinn": true,
-    "hcsoinn_max_proto_per_class": 100,
-    "hcsoinn_alpha": 0.5,
+    "hcsoinn_max_proto_per_class": 60,
+    "hcsoinn_alpha": 0.7,
     "hcsoinn_tau_merge": 0.2,
     "hcsoinn_tau_reject": 2.0,
     "hcsoinn_linkage": "average",
@@ -48,8 +48,8 @@
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.5,
     "hcsoinn_soinn_max_iter": 1,
-    "hcsoinn_soinn_max_degree_for_removal": 0,
+    "hcsoinn_soinn_max_degree_for_removal": 1,
 
-    "analyze_cluster_structure_drift": true
+    "analyze_cluster_structure_drift": false
 }
 

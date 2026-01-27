@@ -8,7 +8,7 @@
     "init_cls": 10,
     "increment": 10,
     "model_name": "dualprompt",
-    "backbone_type": "vit_base_patch16_224_in21k_dualprompt",
+    "backbone_type": "vit_base_patch16_224_dualprompt",
     "get_original_backbone": true,
     "device": ["0"],
     "seed": [1993],
@@ -41,7 +41,7 @@
     "hcsoinn_soinn_ad": 20,
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.8,
-    "hcsoinn_soinn_max_iter": 0.6,
+    "hcsoinn_soinn_max_iter": 1,
 
     "use_ncm": true,
 

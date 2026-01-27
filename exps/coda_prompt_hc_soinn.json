@@ -52,6 +52,8 @@
     "star_lambda": 1,
 
     "analyze_cluster_structure_drift": false,
-    "enable_storage_analysis": true
+    "enable_storage_analysis": true,
+    "use_ncm": false,
+    "visualize_tsne": true
 }
 
