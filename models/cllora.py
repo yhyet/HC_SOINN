@@ -11,6 +11,7 @@ from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
+from utils.STAR import STARAligner
 import random
 
 num_workers = 8
@@ -74,6 +75,10 @@ class Learner(BaseLearner):
 
         # HC-SOINN plugin
         self.use_hc_soinn = args.get("use_hc_soinn", False)
+        # HC-SOINN 特征模式：
+        # - "diagonal": 仅存储/聚类每个类别所属 adapter 的 out_dim 段（推荐，和 CL-LoRA 对角推理一致）
+        # - "full": 存储/聚类完整 concat 特征（更通用，但与对角推理存在不一致）
+        self.hcsoinn_feature_mode = str(args.get("hcsoinn_feature_mode", "diagonal")).lower().strip()
         if self.use_hc_soinn:
             logging.info("Initializing HC-SOINNClassifier")
             self.hc_soinn = HCSOINNClassifier(
@@ -90,6 +95,7 @@ class Learner(BaseLearner):
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
+            logging.info(f"[CL-LoRA] HC-SOINN feature mode: {self.hcsoinn_feature_mode}")
         
         # NCM分类器：初始化类均值存储
         self._class_means = None
@@ -138,20 +144,75 @@ class Learner(BaseLearner):
                 args=args
             )
 
+        # STAR 特征漂移对齐（Trajectory / Rigid）
+        self.use_feature_alignment = args.get("use_feature_alignment", False)
+        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
+        self.star = None
+        if self.use_feature_alignment and self.use_hc_soinn:
+            logging.info("Initializing STARAligner for CL-LoRA")
+
+            def feature_extractor(x, class_id=None):
+                """
+                CL-LoRA + HC-SOINN (diagonal mode):
+                - 返回每个样本/类别所属 adapter 的 out_dim 特征段（与 hcsoinn_feature_mode='diagonal' 一致）
+                - class_id 可以是 int（整批同类）或 shape=[B] 的 tensor/ndarray（逐样本切片）
+                """
+                if isinstance(self._network, nn.DataParallel):
+                    backbone = self._network.module.backbone
+                else:
+                    backbone = self._network.backbone
+
+                feats_full = backbone(x, test=True, use_init_ptm=self.use_init_ptm)  # [B, concat_dim]
+                out_dim = self._network.out_dim
+                offset = self._get_segment_offset()
+
+                # If no class_id is provided, fall back to full features (not recommended for diagonal mode)
+                if class_id is None:
+                    return feats_full
+
+                # scalar class_id: slice the same segment for the whole batch
+                if isinstance(class_id, (int, np.integer)):
+                    adapter_idx = self._get_class_adapter_idx(int(class_id))
+                    seg_idx = adapter_idx + offset
+                    return feats_full[:, seg_idx * out_dim:(seg_idx + 1) * out_dim]
+
+                # batch class_id: per-sample slicing
+                if torch.is_tensor(class_id):
+                    class_ids = class_id.detach().cpu().numpy().astype(np.int64)
+                else:
+                    class_ids = np.asarray(class_id, dtype=np.int64)
+
+                B = feats_full.shape[0]
+                out = torch.empty((B, out_dim), device=feats_full.device, dtype=feats_full.dtype)
+                for i in range(B):
+                    cls = int(class_ids[i])
+                    adapter_idx = self._get_class_adapter_idx(cls)
+                    seg_idx = adapter_idx + offset
+                    s = seg_idx * out_dim
+                    e = s + out_dim
+                    out[i] = feats_full[i, s:e]
+                return out
+
+            self.star = STARAligner(
+                hc_soinn=self.hc_soinn,
+                feature_extractor=feature_extractor,
+                device=self._device,
+                use_full_task_rehearsal=self.use_full_task_rehearsal,
+                star_mode=args.get("star_mode", "trajectory"),
+                star_lambda=args.get("star_lambda", 0.3),
+            )
+            if self.use_full_task_rehearsal:
+                logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
+            else:
+                logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
+
     def after_task(self):
         """
         每个 task 结束后的处理流程
         """
-        # ========== 压缩 HC-SOINN（生成当前任务的节点）==========
-        # 目的：为当前任务的新类别生成 SOINN 原型节点
-        if self.use_hc_soinn:
-            try:
-                # 注意：compress 方法目前不需要额外参数
-                # 因为 buffers 中存储的是完整特征，compress 会处理
-                # 在 predict_topk 中会按 adapter 分段提取簇中心
-                self.hc_soinn.compress()
-            except Exception as e:
-                logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
+        # 注意：为了保证 trainer.py 的调用顺序（incremental_train -> eval_task -> after_task），
+        # HC-SOINN 的 compress 必须在 eval_task 之前完成，否则评估会退化为“无子簇”的 NCM。
+        # 因此 compress 已前移到 incremental_train() 末尾，这里不再重复 compress。
 
         # ========== Step 4: 簇结构分析实验：保存Task 1样本或计算Procrustes距离==========
         if self.cluster_analyzer is not None:
@@ -169,6 +230,21 @@ class Learner(BaseLearner):
             else:
                 # 后续任务：计算Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
+
+        # STAR：为当前任务选择 anchors（用于下一任务的链式漂移对齐）
+        if self.star is not None:
+            current_task_classes = set(range(self._known_classes, self._total_classes))
+            dataset = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train",
+                mode="test",
+            )
+            self.star.select_anchors_for_current_task(
+                dataset=dataset,
+                batch_size=self.batch_size,
+                num_workers=num_workers,
+                current_task_classes=current_task_classes,
+            )
 
         self._known_classes = self._total_classes
         self._network.freeze()
@@ -357,11 +433,26 @@ class Learner(BaseLearner):
         self.replace_fc(self.train_loader_for_protonet)
 
         # 训练结束后，构建分类器（NCM、HC-SOINN等）
+        # ========== Step 0: STAR 漂移对齐（评估前对齐旧类别）==========
+        # trainer.py 的调用顺序是 incremental_train -> eval_task -> after_task
+        # 因此对齐必须发生在 eval_task 之前。
+        if self.star is not None and self._cur_task > 0:
+            current_task_classes = set(range(self._known_classes, self._total_classes))
+            self.star.align_old_classes(
+                cur_task=self._cur_task,
+                current_task_classes=current_task_classes,
+            )
+
         self._build_ncm_classifier()
         
         # 构建 HC-SOINN bank（如果启用）
         if self.use_hc_soinn:
             self._build_hc_soinn_bank()
+            # 评估前压缩：生成当前任务新类的 clusters
+            try:
+                self.hc_soinn.compress()
+            except Exception as e:
+                logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
@@ -606,6 +697,25 @@ class Learner(BaseLearner):
         
         return feature_fn
 
+    def _get_class_adapter_idx(self, class_id: int) -> int:
+        """
+        CL-LoRA 对角规则：class -> adapter_idx
+        - base (0..init_cls-1): adapter_idx=0
+        - task t>0 的增量类：adapter_idx = (class_id - init_cls)//inc + 1
+        """
+        if class_id < self.init_cls:
+            return 0
+        return ((class_id - self.init_cls) // self.inc) + 1
+
+    def _get_segment_offset(self) -> int:
+        """
+        concat 特征的 segment 顺序：
+        - use_init_ptm=False: [adapter_0, adapter_1, ..., cur_adapter]  => offset=0
+        - use_init_ptm=True : [init_ptm, adapter_0, adapter_1, ..., cur_adapter] => offset=1
+        CL-LoRA 的对角分类使用的是 adapter 段，而不是 init_ptm 段。
+        """
+        return 1 if self.use_init_ptm else 0
+
     def _build_hc_soinn_bank(self):
         """
         构建 HC-SOINN bank：类增量学习场景下的累积存储
@@ -629,16 +739,42 @@ class Learner(BaseLearner):
             with torch.no_grad():
                 for _, inputs, targets in loader:
                     inputs = inputs.to(self._device)
-                    batch_feats = feature_fn(inputs)
-                    if isinstance(batch_feats, torch.Tensor):
-                        batch_feats = batch_feats.detach().cpu().numpy()
-                    lbs.append(targets.numpy())
-                    feats.append(batch_feats)
+                    batch_feats_full = feature_fn(inputs)  # [B, concat_dim]
+                    if isinstance(batch_feats_full, torch.Tensor):
+                        batch_feats_full = batch_feats_full.detach().cpu().numpy()
+                    targets_np = targets.numpy()
+
+                    # --- HC-SOINN diagonal mode: only store the class-owned segment ---
+                    if self.hcsoinn_feature_mode == "diagonal":
+                        out_dim = self._network.out_dim
+                        offset = self._get_segment_offset()
+                        batch_feats_diag = np.zeros((batch_feats_full.shape[0], out_dim), dtype=np.float32)
+
+                        for i in range(batch_feats_full.shape[0]):
+                            cls = int(targets_np[i])
+                            adapter_idx = self._get_class_adapter_idx(cls)
+                            seg_idx = adapter_idx + offset
+                            start = seg_idx * out_dim
+                            end = start + out_dim
+                            if end > batch_feats_full.shape[1]:
+                                raise ValueError(
+                                    f"HC-SOINN diagonal feature slice out of range: "
+                                    f"cls={cls}, adapter_idx={adapter_idx}, seg_idx={seg_idx}, "
+                                    f"slice=[{start}:{end}], feat_dim={batch_feats_full.shape[1]}"
+                                )
+                            batch_feats_diag[i] = batch_feats_full[i, start:end]
+
+                        feats.append(batch_feats_diag)
+                        lbs.append(targets_np)
+                    else:
+                        # "full": store full concat features
+                        feats.append(batch_feats_full)
+                        lbs.append(targets_np)
             if len(feats) == 0:
                 return
             feats_np = np.concatenate(feats, axis=0)
             lbs_np = np.concatenate(lbs, axis=0)
-            # HC-SOINN 标准模式：存储完整特征的原型
+            # HC-SOINN：存储“对角段”特征（或完整特征，取决于 feature_mode）
             self.hc_soinn.add_features(feats_np, lbs_np)
 
         # 类增量学习：每个任务只使用当前任务的新类别训练数据
@@ -655,10 +791,7 @@ class Learner(BaseLearner):
         )
         add_from_loader(current_task_loader)
 
-        # 注意：compress() 在 after_task() 中已经调用，这里不需要重复调用
-        # 但是，如果这是第一个任务，after_task 可能在 _build_hc_soinn_bank 之前调用，
-        # 所以这里需要确保在添加特征后再次压缩（如果还没有压缩过）
-        # 实际上，after_task 在 incremental_train 之后调用，所以这里不需要再次压缩
+        # 注意：compress() 已前移到 incremental_train() 末尾（评估前），这里不需要重复调用
 
     def _eval_hc_soinn(self, loader):
         """
@@ -680,9 +813,10 @@ class Learner(BaseLearner):
         y_pred, y_true = [], []
         feature_fn = self._get_hc_soinn_feature_fn()
         out_dim = self._network.out_dim
-        num_adapters = self._cur_task + 1
+        num_adapters = self._cur_task + 1  # adapter 段数量（不包含 init_ptm）
+        offset = self._get_segment_offset()
         
-        # 获取 HC-SOINN 的所有类别原型（完整特征）
+        # 获取 HC-SOINN 的所有类别原型
         hc_soinn = self.hc_soinn
         all_classes = sorted(hc_soinn.class_mu.keys())
         
@@ -713,7 +847,8 @@ class Learner(BaseLearner):
                 
                 for adapter_idx in range(num_adapters):
                     # 提取当前 adapter 的特征段
-                    adapter_feats = feats_t[:, adapter_idx * out_dim:(adapter_idx + 1) * out_dim]  # [B, out_dim]
+                    seg_idx = adapter_idx + offset
+                    adapter_feats = feats_t[:, seg_idx * out_dim:(seg_idx + 1) * out_dim]  # [B, out_dim]
                     
                     # 确定当前 adapter 对应的类别范围
                     if adapter_idx == 0:
@@ -728,11 +863,10 @@ class Learner(BaseLearner):
                     valid_classes = []
                     for cls in all_classes:
                         if start_cls <= cls < end_cls:  # 只处理属于当前 adapter 的类别
-                            cls_mu_full = hc_soinn.class_mu[cls]  # [num_adapters * out_dim]
-                            if cls_mu_full.shape[0] >= (adapter_idx + 1) * out_dim:
-                                # 提取对应 adapter 段的原型
-                                cls_mu_adapter = cls_mu_full[adapter_idx * out_dim:(adapter_idx + 1) * out_dim]
-                                ncm_centers.append(cls_mu_adapter)
+                            cls_mu = hc_soinn.class_mu[cls]
+                            # diagonal 模式下，class_mu 应该就是 out_dim
+                            if cls_mu.shape[0] == out_dim:
+                                ncm_centers.append(cls_mu)
                                 valid_classes.append(cls)
                     
                     if len(ncm_centers) == 0:
@@ -754,12 +888,11 @@ class Learner(BaseLearner):
                         for cls in valid_classes:
                             clusters = hc_soinn.class_clusters.get(cls, [])
                             if clusters:
-                                # 提取每个子簇中心对应的 adapter 段
+                                # diagonal 模式下，cluster center 应该就是 out_dim
                                 cluster_centers = []
                                 for c in clusters:
-                                    if c.center.shape[0] >= (adapter_idx + 1) * out_dim:
-                                        cluster_center_adapter = c.center[adapter_idx * out_dim:(adapter_idx + 1) * out_dim]
-                                        cluster_centers.append(cluster_center_adapter)
+                                    if c.center.shape[0] == out_dim:
+                                        cluster_centers.append(c.center)
                                 
                                 if cluster_centers:
                                     cluster_centers_t = torch.from_numpy(np.stack(cluster_centers)).float().to(self._device)
