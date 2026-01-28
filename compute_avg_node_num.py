@@ -15,19 +15,35 @@ def extract_node_counts_from_log(log_file_path):
     node_counts = []
     total_classes = 0
     
-    with open(log_file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            # 提取节点数量：匹配 "soinn_refined=数字"
-            match = re.search(r'soinn_refined=(\d+)', line)
-            if match:
-                node_count = int(match.group(1))
-                node_counts.append(node_count)
-            
-            # 尝试从最后任务中提取总类别数
-            # 匹配 "Task X, Epoch" 或 "total classes: X"
-            class_match = re.search(r'total classes:\s*(\d+)', line)
-            if class_match:
-                total_classes = max(total_classes, int(class_match.group(1)))
+    # 尝试多种编码格式
+    encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1', 'cp1252']
+    file_content = None
+    
+    for encoding in encodings:
+        try:
+            with open(log_file_path, 'r', encoding=encoding, errors='ignore') as f:
+                file_content = f.readlines()
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    
+    if file_content is None:
+        # 如果所有编码都失败，使用二进制模式读取
+        with open(log_file_path, 'rb') as f:
+            file_content = f.read().decode('utf-8', errors='ignore').splitlines()
+    
+    for line in file_content:
+        # 提取节点数量：匹配 "soinn_refined=数字"
+        match = re.search(r'soinn_refined=(\d+)', line)
+        if match:
+            node_count = int(match.group(1))
+            node_counts.append(node_count)
+        
+        # 尝试从最后任务中提取总类别数
+        # 匹配 "Task X, Epoch" 或 "total classes: X"
+        class_match = re.search(r'total classes:\s*(\d+)', line)
+        if class_match:
+            total_classes = max(total_classes, int(class_match.group(1)))
     
     # 如果没有找到total classes，使用节点数量作为类别数
     if total_classes == 0:
