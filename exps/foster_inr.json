@@ -1,5 +1,5 @@
 {
-    "prefix": "cil",
+    "prefix": "",
     "dataset": "imagenetr",
     "memory_size": 4000,
     "memory_per_class": 20,
