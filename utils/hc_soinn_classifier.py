@@ -365,6 +365,7 @@ class HCSOINNClassifier:
         soinn_threshold_scale: float = 0.5,
         soinn_max_iter: int = 3,
         soinn_max_degree_for_removal: int = 1,
+        coarse_topk: Optional[int] = None,
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -382,6 +383,11 @@ class HCSOINNClassifier:
         self.soinn_threshold_scale = float(soinn_threshold_scale)
         self.soinn_max_iter = int(soinn_max_iter)
         self.soinn_max_degree_for_removal = int(soinn_max_degree_for_removal)
+
+        # Two-stage coarse filtering: use NCM to shortlist candidate classes
+        # before computing expensive sub-cluster distances.
+        # None = disabled (evaluate all classes); int = number of NCM candidates.
+        self.coarse_topk = None if coarse_topk is None else int(coarse_topk)
 
         # 类中心（NCM）与样本计数
         self.class_mu: Dict[int, np.ndarray] = {}  # Normalized NCM centers for inference
@@ -776,6 +782,9 @@ class HCSOINNClassifier:
 
         # Build/reuse cached prototype tensors on the target device
         self._ensure_predict_cache(device=device, query_dim=query_dim, valid_classes=valid_classes)
+
+        # ---- Optimization: normalize query ONCE for the entire call ----
+        q_norm = torch.nn.functional.normalize(query_t, p=2, dim=1)  # [N, D]
         
         # -----------------------------------------------------------
         # 辅助函数：计算距离 (支持 EASE Reweighting 或 标准 Cosine)
@@ -788,8 +797,7 @@ class HCSOINNClassifier:
             """
             if use_ease_reweighting and cur_task > 0:
                 # EASE 风格：分块归一化 + 加权点积
-                # chunk_dim = 768 (假设)
-                chunk_dim = 768 # 硬编码或从参数推断
+                chunk_dim = 768
                 num_chunks = query_dim // chunk_dim
                 
                 # Reshape: [N, T, C]
@@ -800,20 +808,9 @@ class HCSOINNClassifier:
                 q_chunks = torch.nn.functional.normalize(q_chunks, p=2, dim=2)
                 p_chunks = torch.nn.functional.normalize(p_chunks, p=2, dim=2)
                 
-                # Compute dot product per chunk: [N, M, T]
-                # q: [N, T, D'] -> [N, 1, T, D']
-                # p: [M, T, D'] -> [1, M, T, D']
-                # product: sum(q * p, dim=-1) -> [N, M, T]
                 sim_per_chunk = (q_chunks.unsqueeze(1) * p_chunks.unsqueeze(0)).sum(dim=-1)
                 
-                # Apply weights
-                # Weights depend on:
-                # 1. Chunk index (j in 0..T-1)
-                # 2. Class Task ID (i in 0..T-1)
-                
-                # Determine task_id for each prototype
-                # labels_t: [M]
-                if labels_t is None: # NCM case where protos are ordered by valid_classes
+                if labels_t is None:
                     proto_task_ids = []
                     for c in valid_classes:
                         if c < init_cls:
@@ -821,46 +818,30 @@ class HCSOINNClassifier:
                         else:
                             tid = (c - init_cls) // task_increment + 1
                         proto_task_ids.append(tid)
-                    proto_task_ids = torch.tensor(proto_task_ids, device=device) # [M]
+                    proto_task_ids = torch.tensor(proto_task_ids, device=device)
                 else:
-                    # Map labels to task ids
-                    # This is slow, better vectorized
                     proto_task_ids = torch.zeros_like(labels_t)
                     mask_init = labels_t < init_cls
                     proto_task_ids[mask_init] = 0
                     proto_task_ids[~mask_init] = (labels_t[~mask_init] - init_cls) // task_increment + 1
                 
-                # Construct weight matrix [M, T]
-                # If chunk_idx != task_id: weight = alpha / cur_task
-                # Else: weight = 1.0
-                # Note: EASE logic is: if j != i: alpha/cur_task.
-                # Here j is chunk_idx (0..cur_task), i is proto_task_id
-                
                 M = protos_t.shape[0]
                 T = num_chunks
                 weights = torch.ones(M, T, device=device)
                 
-                # Expand proto_task_ids to [M, T]
-                task_ids_expanded = proto_task_ids.unsqueeze(1).expand(M, T) # [M, T]
-                chunk_indices = torch.arange(T, device=device).unsqueeze(0).expand(M, T) # [M, T]
+                task_ids_expanded = proto_task_ids.unsqueeze(1).expand(M, T)
+                chunk_indices = torch.arange(T, device=device).unsqueeze(0).expand(M, T)
                 
-                # Apply penalty mask
                 penalty_mask = (chunk_indices != task_ids_expanded)
-                # re-weight factor from EASE
                 factor = ease_alpha / float(cur_task)
                 weights[penalty_mask] = factor
                 
-                # Weighted Sum: [N, M]
-                # sim_per_chunk: [N, M, T]
-                # weights: [M, T] -> [1, M, T]
                 weighted_sim = (sim_per_chunk * weights.unsqueeze(0)).sum(dim=2)
                 
-                return 1.0 - weighted_sim # Convert to distance-like (sort order)
+                return 1.0 - weighted_sim
                 
             else:
-                # 标准 Cosine Distance
-                q_norm = torch.nn.functional.normalize(query_t, p=2, dim=1)
-                # protos_t are expected to already be normalized (stored as such in HC-SOINN)
+                # 标准 Cosine Distance — reuse pre-normalized q_norm
                 sim = torch.mm(q_norm, protos_t.t())
                 return 1.0 - sim
 
@@ -869,36 +850,69 @@ class HCSOINNClassifier:
         # -----------------------------------------------------------
         ncm_centers_t = self._predict_cache["ncm_centers_t"]
         
-        # NCM 不需要 label 参数，因为顺序对应 valid_classes
         dist_ncm = compute_distance(ncm_centers_t)  # [N, C]
         
         # -----------------------------------------------------------
-        # 2. 计算 Sub-Cluster 距离
+        # 2. 计算 Sub-Cluster 距离 (with optional two-stage coarse filtering)
         # -----------------------------------------------------------
         all_protos_t = self._predict_cache["all_protos_t"]
         proto_labels_t = self._predict_cache["proto_labels_t"]
         proto_class_index_t = self._predict_cache["proto_class_index_t"]
 
-        dist_proto_all = compute_distance(all_protos_t, proto_labels_t)  # [N, M]
-
-        # Fast per-class min over prototypes: dist_sub[n, c] = min_{m in class c} dist_proto_all[n, m]
-        # This replaces the Python loop with boolean masks.
         C = len(valid_classes)
-        N = dist_proto_all.shape[0]
-        dist_sub = torch.full((N, C), float("inf"), device=device, dtype=dist_proto_all.dtype)
+        N = query_t.shape[0]
 
-        if hasattr(dist_sub, "scatter_reduce_"):
-            idx = proto_class_index_t.view(1, -1).expand(N, -1)  # [N, M]
-            dist_sub.scatter_reduce_(1, idx, dist_proto_all, reduce="amin", include_self=True)
+        coarse_k = self.coarse_topk
+        use_coarse = (
+            coarse_k is not None
+            and coarse_k < C
+            and not (use_ease_reweighting and cur_task > 0)
+        )
+
+        if use_coarse:
+            # ---- Two-stage: NCM coarse filter → sub-cluster refine ----
+            _, coarse_indices = torch.topk(dist_ncm, k=coarse_k, dim=1, largest=False)  # [N, coarse_k]
+            candidate_set = torch.unique(coarse_indices.reshape(-1))  # union across batch
+
+            candidate_mask_C = torch.zeros(C, dtype=torch.bool, device=device)
+            candidate_mask_C[candidate_set] = True
+            proto_in_candidate = candidate_mask_C[proto_class_index_t]  # [M] bool mask
+
+            filtered_indices = proto_in_candidate.nonzero(as_tuple=True)[0]
+            filtered_protos = all_protos_t[filtered_indices]               # [M', D]
+            filtered_class_index = proto_class_index_t[filtered_indices]   # [M']
+
+            dist_filtered = 1.0 - torch.mm(q_norm, filtered_protos.t())    # [N, M']
+
+            dist_sub = torch.full((N, C), float("inf"), device=device, dtype=dist_filtered.dtype)
+
+            if hasattr(dist_sub, "scatter_reduce_"):
+                idx = filtered_class_index.view(1, -1).expand(N, -1)
+                dist_sub.scatter_reduce_(1, idx, dist_filtered, reduce="amin", include_self=True)
+            else:
+                for ci in candidate_set.tolist():
+                    mask = (filtered_class_index == ci)
+                    if mask.any():
+                        min_d, _ = dist_filtered[:, mask].min(dim=1)
+                        dist_sub[:, ci] = min_d
+
         else:
-            # Fallback for older torch: keep previous behavior (slower)
-            for i, cls in enumerate(valid_classes):
-                mask = (proto_labels_t == cls)
-                if mask.any():
-                    min_d, _ = dist_proto_all[:, mask].min(dim=1)
-                    dist_sub[:, i] = min_d
-                else:
-                    dist_sub[:, i] = dist_ncm[:, i]
+            # ---- Original: evaluate all prototypes ----
+            dist_proto_all = compute_distance(all_protos_t, proto_labels_t)  # [N, M]
+
+            dist_sub = torch.full((N, C), float("inf"), device=device, dtype=dist_proto_all.dtype)
+
+            if hasattr(dist_sub, "scatter_reduce_"):
+                idx = proto_class_index_t.view(1, -1).expand(N, -1)  # [N, M]
+                dist_sub.scatter_reduce_(1, idx, dist_proto_all, reduce="amin", include_self=True)
+            else:
+                for i, cls in enumerate(valid_classes):
+                    mask = (proto_labels_t == cls)
+                    if mask.any():
+                        min_d, _ = dist_proto_all[:, mask].min(dim=1)
+                        dist_sub[:, i] = min_d
+                    else:
+                        dist_sub[:, i] = dist_ncm[:, i]
         
         # 融合分数
         # score = alpha * d_ncm + (1 - alpha) * d_sub
