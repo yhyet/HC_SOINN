@@ -1,5 +1,5 @@
 {
-    "prefix": "Trajectory_STAR",
+    "prefix": "Trajectory_STAR_tsne_in21k_lam_0p99",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -8,7 +8,7 @@
     "init_cls": 10,
     "increment": 10,
     "model_name": "coda_prompt",
-    "backbone_type": "vit_base_patch16_224_coda_prompt",
+    "backbone_type": "vit_base_patch16_224_in21k_coda_prompt",
     "device": ["0"],
     "seed": [0],
     
@@ -49,9 +49,8 @@
     "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
     "star_mode": "trajectory",
-    "star_lambda": 1,
+    "star_lambda": 0.99,
     "enable_storage_analysis": true,
     "use_ncm": false,
-    "visualize_tsne": true
+    "visualize_tsne": false
 }
-

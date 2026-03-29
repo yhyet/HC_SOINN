@@ -1,5 +1,5 @@
 {
-    "prefix": "Trajectory_STAR",
+    "prefix": "coda_hcsoinn_cifar_ad_15",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -35,7 +35,7 @@
     "hcsoinn_linkage": "average",
     "hcsoinn_distance": "cosine",
     "hcsoinn_use_soinn_refinement": true,
-    "hcsoinn_soinn_ad": 20,
+    "hcsoinn_soinn_ad": 15,
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.8,
     "hcsoinn_soinn_max_iter": 1,
@@ -46,12 +46,13 @@
     "load_all_checkpoints": false,
 
 
-    "use_feature_alignment": true,
+    "use_feature_alignment": false,
     "use_full_task_rehearsal": false,
     "star_mode": "trajectory",
     "star_lambda": 1,
+
+    "analyze_cluster_structure_drift": false,
     "enable_storage_analysis": true,
     "use_ncm": false,
     "visualize_tsne": true
 }
-

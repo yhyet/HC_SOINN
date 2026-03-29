@@ -1,5 +1,5 @@
 {
-    "prefix": " ",
+    "prefix": "soinn_ad_15",
     "dataset": "cub",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -28,10 +28,8 @@
     "hcsoinn_linkage": "average",
     "hcsoinn_distance": "cosine",
     "hcsoinn_use_soinn_refinement": true,
-    "hcsoinn_soinn_ad": 20,
+    "hcsoinn_soinn_ad": 15,
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.8,
     "hcsoinn_soinn_max_iter": 1
 }
-
-
