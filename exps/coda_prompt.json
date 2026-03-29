@@ -30,5 +30,5 @@
     "test_only_first_task_classes": false,
     "analyze_cluster_structure_drift": false,
     "use_ncm": false,
-    "enable_storage_analysis": true
+    "enable_storage_analysis": false
 }

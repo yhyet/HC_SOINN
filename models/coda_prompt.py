@@ -88,6 +88,7 @@ class Learner(BaseLearner):
                 soinn_threshold_scale=args.get("hcsoinn_soinn_threshold_scale", 0.5),
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
+                coarse_topk=args.get("hcsoinn_coarse_topk", None),
             )
         elif self.use_soinn:
             # 处理 seed 参数：如果传入的是列表，取第一个元素
