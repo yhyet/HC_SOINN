@@ -1,5 +1,5 @@
 {
-    "prefix": "Trajectory_STAR",
+    "prefix": "",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,

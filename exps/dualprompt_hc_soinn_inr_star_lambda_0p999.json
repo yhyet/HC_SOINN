@@ -1,25 +1,25 @@
 {
-    "prefix": "",
-    "dataset": "cub",
+    "prefix": "dualprompt_hcsoinn_star_inr_lam_0p999",
+    "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
-    "shuffle": false,
-    "init_cls": 10,
-    "increment": 10,
+    "shuffle": true,
+    "init_cls": 5,
+    "increment": 5,
     "model_name": "dualprompt",
     "backbone_type": "vit_base_patch16_224_dualprompt",
     "get_original_backbone": true,
     "device": ["0"],
     "seed": [1993],
     
-    "tuned_epoch": 20,
+    "tuned_epoch": 10,
     "init_lr": 0.001,
-    "batch_size": 128,
+    "batch_size": 24,
     "weight_decay": 0,
     "min_lr": 1e-5,
     "optimizer": "adam",
-    "scheduler": "cosine",
+    "scheduler": "constant",
     "reinit_optimizer": true,
 
     "global_pool": "token",
@@ -45,12 +45,11 @@
 
     "use_ncm": true,
 
-    "use_feature_alignment": false,
+    "use_feature_alignment": true,
     "analyze_cluster_structure_drift": false,
     "test_only_first_task_classes": false,
     "star_mode": "trajectory",
-    "star_lambda": 1,
-
+    "star_lambda": 0.999,
 
     "use_g_prompt": true,
     "g_prompt_length": 5,
