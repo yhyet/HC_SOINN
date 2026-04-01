@@ -24,7 +24,7 @@ def plot_node_budget_sensitivity():
              marker='s', color='red', label='$A_{Last}$', linewidth=4, markersize=12)
     
     # 设置图形属性（加大字体）
-    ax.set_xlabel('$K_{max}$', fontsize=32)
+    ax.set_xlabel('$K_{init}$', fontsize=32)
     ax.set_ylabel('Accuracy (%)', fontsize=24)
     # ax.set_title('Sensitivity Analysis of Node Budget $K_{max}$', fontsize=26, pad=20)
     
@@ -62,10 +62,18 @@ def plot_node_budget_sensitivity():
     
     # 添加网格
     ax.grid(True, alpha=0.3, linestyle=':', linewidth=2)
-    
-    # 调整布局
-    plt.tight_layout()
-    
+
+    plt.tight_layout(rect=[0, 0.11, 1, 1])
+
+    # caption = (
+    #     r"Sensitivity of $A_{\mathrm{Avg}}$ and $A_{\mathrm{Last}}$ to HC-SOINN "
+    #     r"per-class prototype budget $K_{\max}$ "
+    #     r"(maximum sub-prototypes after hierarchical clustering)."
+    # )
+    footnote = "Setup: CODA-Prompt + HC-SOINN on CIFAR-100"
+    # fig.text(0.5, 0.065, caption, ha="center", va="bottom", fontsize=20)
+    fig.text(0.5, 0.025, footnote, ha="center", va="bottom", fontsize=24, style="italic")
+
     # 保存图形
     output_filename = 'node_budget_sensitivity_analysis.png'
     plt.savefig(output_filename, dpi=300, bbox_inches='tight')

@@ -11,6 +11,7 @@ from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.STAR import STARAligner
+from utils.hc_soinn_node_stats import log_hc_soinn_dataset_end_summary
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
 import os
 
@@ -183,6 +184,7 @@ class Learner(BaseLearner):
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
 
         self._known_classes = self._total_classes
+        log_hc_soinn_dataset_end_summary(self)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1

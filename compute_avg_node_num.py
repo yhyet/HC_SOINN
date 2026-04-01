@@ -119,5 +119,14 @@ def main():
     print("-" * 60)
     print(f"\n每个类别的节点数: {result['node_counts']}")
 
+def summarize_hc_soinn_from_classifier(hc_soinn):
+    """
+    从运行中的 HCSOINNClassifier 得到与本脚本相同的统计口径（每类节点数列表、均值等）。
+    实现位于 utils.hc_soinn_node_stats，供 CodaPrompt / SEMA / DualPrompt 等在数据集结束时打 log。
+    """
+    from utils.hc_soinn_node_stats import summarize_hc_soinn_classifier
+    return summarize_hc_soinn_classifier(hc_soinn)
+
+
 if __name__ == '__main__':
     main()

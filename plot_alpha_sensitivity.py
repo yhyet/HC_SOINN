@@ -4,12 +4,16 @@ import numpy as np
 
 def plot_alpha_sensitivity():
     """绘制hcsoinn_alpha参数敏感性分析折线图"""
-    
+    # 与论文图注一致：SimpleCIL 设定 + 数据集名（按需修改）
+    dataset_name = "CIFAR-100"  # e.g. "ImageNet-R", "CUB-200", etc.
+
     # 数据
     alpha_values = [0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]
     avg_acc = [64.31, 68.17, 69.69, 69.97, 70.43, 69.40, 68.05]
     last_acc = [58.28, 62.02, 63.63, 63.93, 63.98, 63.00, 61.35]
     
+    # avg_acc = [64.31, 68.17, 69.69, 69.97, 70.43, 69.40, 68.05]
+    # last_acc = [58.28, 62.02, 63.63, 63.93, 63.98, 63.00, 61.35]
     # 创建图形
     fig, ax = plt.subplots(figsize=(10, 10))
     
