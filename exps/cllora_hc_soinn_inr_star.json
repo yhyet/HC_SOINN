@@ -1,14 +1,14 @@
 {
-    "prefix": "Trajectory_STAR_10task",
+    "prefix": "Trajectory_STAR",
     "dataset": "imagenetr",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
     "shuffle": true,
-    "init_cls": 20,
-    "increment": 20,
+    "init_cls": 5,
+    "increment": 5,
     "model_name": "cllora",
-    "backbone_type": "vit_base_patch16_224_in21k_cllora",
+    "backbone_type": "vit_base_patch16_224_cllora",
     "device": ["0"],
     "seed": [1993],
     
@@ -53,12 +53,12 @@
     "hcsoinn_soinn_ad": 20,
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.8,
-    "hcsoinn_soinn_max_iter": 1,
+    "hcsoinn_soinn_max_iter": 2,
 
     "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
     "star_mode": "trajectory",
-    "star_lambda": 1,
+    "star_lambda": 0.95,
 
     "analyze_cluster_structure_drift": false
 }

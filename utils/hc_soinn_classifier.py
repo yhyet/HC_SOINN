@@ -735,7 +735,7 @@ class HCSOINNClassifier:
     # 预测 (GPU 加速版)
     # ------------------------------------------------------------------ #
     def predict_topk(
-        self, query_features: np.ndarray, topk: int, total_classes: int, device=None,
+        self, query_features, topk: int, total_classes: int, device=None,
         use_ease_reweighting: bool = False,
         cur_task: int = 0,
         task_increment: int = 10,
@@ -747,7 +747,8 @@ class HCSOINNClassifier:
         使用 GPU 矩阵运算加速
         
         Args:
-            query_features: [N, D] 查询特征
+            query_features: [N, D] 查询特征 (torch.Tensor 或 np.ndarray，
+                            若为已在 device 上的 Tensor 则跳过 H2D 拷贝)
             topk: 返回前K个
             total_classes: 总类别数（用于fallback）
             device: 计算设备
@@ -763,22 +764,26 @@ class HCSOINNClassifier:
         if device is None:
             device = torch.device("cpu")
 
-        query_features = np.asarray(query_features, dtype=np.float32)
-        query_dim = query_features.shape[1]
+        # 接受 torch.Tensor 或 np.ndarray；若 Tensor 已在目标 device 上则零拷贝
+        if isinstance(query_features, torch.Tensor):
+            query_t = query_features.detach().to(device=device, dtype=torch.float32)
+        else:
+            query_features = np.asarray(query_features, dtype=np.float32)
+            query_t = torch.from_numpy(query_features).to(device=device, dtype=torch.float32)
+
+        query_dim = query_t.shape[1]
         
         # 标准模式：使用完整的特征
         classes = sorted(self.class_mu.keys())
         if len(classes) == 0:
             fallback = np.arange(min(topk, max(total_classes, 1)), dtype=np.int64)
-            return np.tile(fallback, (query_features.shape[0], 1))
+            return np.tile(fallback, (query_t.shape[0], 1))
         
         # 筛选有效类别
         valid_classes = [cls for cls in classes if self.class_mu[cls].shape[0] == query_dim]
         
         if not valid_classes:
-            return np.zeros((query_features.shape[0], topk), dtype=np.int64)
-
-        query_t = torch.from_numpy(query_features).to(device=device, dtype=torch.float32)
+            return np.zeros((query_t.shape[0], topk), dtype=np.int64)
 
         # Build/reuse cached prototype tensors on the target device
         self._ensure_predict_cache(device=device, query_dim=query_dim, valid_classes=valid_classes)
@@ -928,6 +933,74 @@ class HCSOINNClassifier:
         top_preds = valid_classes_t[indices]  # [N, topk]
         
         return top_preds
+
+    def predict_class_logits(
+        self,
+        query_features,
+        total_classes: int,
+        device=None,
+    ) -> torch.Tensor:
+        """
+        Return per-class logits aligned to [0, total_classes).
+        Logits are the negative fused distance (higher is better).
+        """
+        if device is None:
+            device = torch.device("cpu")
+
+        if isinstance(query_features, torch.Tensor):
+            query_t = query_features.detach().to(device=device, dtype=torch.float32)
+        else:
+            query_features = np.asarray(query_features, dtype=np.float32)
+            query_t = torch.from_numpy(query_features).to(device=device, dtype=torch.float32)
+
+        if query_t.shape[0] == 0:
+            return torch.empty((0, total_classes), device=device, dtype=torch.float32)
+
+        query_dim = query_t.shape[1]
+        classes = sorted(self.class_mu.keys())
+        valid_classes = [cls for cls in classes if self.class_mu[cls].shape[0] == query_dim]
+
+        # Start from very small logits for all classes.
+        full_logits = torch.full(
+            (query_t.shape[0], total_classes),
+            float("-inf"),
+            device=device,
+            dtype=torch.float32,
+        )
+        if len(valid_classes) == 0:
+            return full_logits
+
+        self._ensure_predict_cache(device=device, query_dim=query_dim, valid_classes=valid_classes)
+
+        q_norm = torch.nn.functional.normalize(query_t, p=2, dim=1)
+        ncm_centers_t = self._predict_cache["ncm_centers_t"]      # [C, D]
+        all_protos_t = self._predict_cache["all_protos_t"]        # [M, D]
+        proto_labels_t = self._predict_cache["proto_labels_t"]    # [M]
+        proto_class_index_t = self._predict_cache["proto_class_index_t"]  # [M]
+
+        # Distances in cosine space.
+        dist_ncm = 1.0 - torch.mm(q_norm, ncm_centers_t.t())      # [N, C]
+        dist_proto_all = 1.0 - torch.mm(q_norm, all_protos_t.t()) # [N, M]
+
+        C = len(valid_classes)
+        N = query_t.shape[0]
+        dist_sub = torch.full((N, C), float("inf"), device=device, dtype=dist_proto_all.dtype)
+        if hasattr(dist_sub, "scatter_reduce_"):
+            idx = proto_class_index_t.view(1, -1).expand(N, -1)
+            dist_sub.scatter_reduce_(1, idx, dist_proto_all, reduce="amin", include_self=True)
+        else:
+            for i, cls in enumerate(valid_classes):
+                mask = (proto_labels_t == cls)
+                if mask.any():
+                    min_d, _ = dist_proto_all[:, mask].min(dim=1)
+                    dist_sub[:, i] = min_d
+                else:
+                    dist_sub[:, i] = dist_ncm[:, i]
+
+        final_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub  # lower is better
+        valid_class_ids = torch.tensor(valid_classes, device=device, dtype=torch.long)
+        full_logits[:, valid_class_ids] = -final_scores
+        return full_logits
 
     # ------------------------------------------------------------------ #
     # 特征漂移对齐支持

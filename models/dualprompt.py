@@ -40,6 +40,11 @@ class Learner(BaseLearner):
 
         # HC-SOINN plugin
         self.use_hc_soinn = args.get("use_hc_soinn", False)
+        self.use_hc_soinn_fc_fusion = args.get("use_hc_soinn_fc_fusion", False)
+        self.hc_soinn_fc_fusion_b = float(args.get("hc_soinn_fc_fusion_b", 0.3))
+        self.hc_soinn_fc_fusion_a = float(args.get("hc_soinn_fc_fusion_a", 1.0 - self.hc_soinn_fc_fusion_b))
+        self.hc_soinn_fc_calib_temp = float(args.get("hc_soinn_fc_calib_temp", 1.0))
+        self.hc_soinn_hc_calib_temp = float(args.get("hc_soinn_hc_calib_temp", 1.0))
         if self.use_hc_soinn:
             logging.info("Initializing HC-SOINNClassifier for DualPrompt")
             self.hc_soinn = HCSOINNClassifier(
@@ -56,6 +61,12 @@ class Learner(BaseLearner):
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
+            if self.use_hc_soinn_fc_fusion:
+                logging.info(
+                    "HC-SOINN + Calibrated FC fusion enabled: "
+                    f"a={self.hc_soinn_fc_fusion_a:.3f}, b={self.hc_soinn_fc_fusion_b:.3f}, "
+                    f"fc_temp={self.hc_soinn_fc_calib_temp:.3f}, hc_temp={self.hc_soinn_hc_calib_temp:.3f}"
+                )
         
         # STAR Feature Alignment
         self.use_feature_alignment = args.get("use_feature_alignment", False)
@@ -547,6 +558,35 @@ class Learner(BaseLearner):
                 y_true.append(targets.cpu().numpy())
         return np.concatenate(y_pred), np.concatenate(y_true)
 
+    def _eval_hc_soinn_fc_fusion(self, loader):
+        """
+        Fusion experiment:
+        result = a * HC-SOINN + b * (Calibrated FC), where calibrated scores are probabilities.
+        """
+        self._network.eval()
+        y_pred, y_true = [], []
+        feature_fn = self._get_soinn_feature_fn()
+
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                fc_logits = self._network(inputs, task_id=self._cur_task)["logits"][:, :self._total_classes]
+                feats = feature_fn(inputs)
+                feats = F.normalize(feats, p=2, dim=1)
+                hc_logits = self.hc_soinn.predict_class_logits(
+                    feats, self._total_classes, device=self._device
+                )
+
+                fc_probs = torch.softmax(fc_logits / self.hc_soinn_fc_calib_temp, dim=1)
+                hc_probs = torch.softmax(hc_logits / self.hc_soinn_hc_calib_temp, dim=1)
+                fused_probs = self.hc_soinn_fc_fusion_a * hc_probs + self.hc_soinn_fc_fusion_b * fc_probs
+
+                predicts = torch.topk(fused_probs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                y_pred.append(predicts.cpu().numpy())
+                y_true.append(targets.cpu().numpy())
+
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
     def eval_task(self):
         """
         评估任务：评估多种分类器
@@ -567,6 +607,9 @@ class Learner(BaseLearner):
         if getattr(self, "use_hc_soinn", False):
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
+            if self.use_hc_soinn_fc_fusion:
+                y_pred_mix, y_true_mix = self._eval_hc_soinn_fc_fusion(self.test_loader)
+                results["hc_soinn_fc_fusion"] = self._evaluate(y_pred_mix, y_true_mix)
         
         # 3. 使用 NCM 分类器评估
         if getattr(self, "use_ncm", False) and self._class_means is not None:

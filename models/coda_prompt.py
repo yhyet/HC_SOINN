@@ -72,6 +72,11 @@ class Learner(BaseLearner):
         
         # SOINN / HC-SOINN plugins（互斥，优先 HC-SOINN）
         self.use_hc_soinn = args.get("use_hc_soinn", False)
+        self.use_hc_soinn_fc_fusion = args.get("use_hc_soinn_fc_fusion", False)
+        self.hc_soinn_fc_fusion_b = float(args.get("hc_soinn_fc_fusion_b", 0.3))
+        self.hc_soinn_fc_fusion_a = float(args.get("hc_soinn_fc_fusion_a", 1.0 - self.hc_soinn_fc_fusion_b))
+        self.hc_soinn_fc_calib_temp = float(args.get("hc_soinn_fc_calib_temp", 1.0))
+        self.hc_soinn_hc_calib_temp = float(args.get("hc_soinn_hc_calib_temp", 1.0))
         self.use_soinn = args.get("use_soinn", False) and not self.use_hc_soinn
         if self.use_hc_soinn:
             logging.info("Initializing HC-SOINNClassifier")
@@ -90,6 +95,12 @@ class Learner(BaseLearner):
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
                 coarse_topk=args.get("hcsoinn_coarse_topk", None),
             )
+            if self.use_hc_soinn_fc_fusion:
+                logging.info(
+                    "HC-SOINN + Calibrated FC fusion enabled: "
+                    f"a={self.hc_soinn_fc_fusion_a:.3f}, b={self.hc_soinn_fc_fusion_b:.3f}, "
+                    f"fc_temp={self.hc_soinn_fc_calib_temp:.3f}, hc_temp={self.hc_soinn_hc_calib_temp:.3f}"
+                )
         elif self.use_soinn:
             # 处理 seed 参数：如果传入的是列表，取第一个元素
             seed = args.get("seed", None)
@@ -1117,7 +1128,7 @@ class Learner(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def _eval_hc_soinn(self, loader):
-        """使用 HC-SOINN 分类器进行评估"""
+        """使用 HC-SOINN 分类器进行评估（直接传 GPU tensor，避免 GPU→CPU→GPU 往返拷贝）"""
         self._network.eval()
         y_pred, y_true = [], []
         feature_fn = self._get_soinn_feature_fn()
@@ -1125,14 +1136,8 @@ class Learner(BaseLearner):
             for _, (_, inputs, targets) in enumerate(loader):
                 inputs = inputs.to(self._device)
                 feats = feature_fn(inputs)
-                feats = feats.detach().cpu()
-                if len(feats.shape) == 1:
-                    feats = feats.reshape(1, -1)
-                elif len(feats.shape) != 2:
-                    raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
-                feats_np = feats.numpy()
                 topk_pred = self.hc_soinn.predict_topk(
-                    feats_np, self.topk, self._total_classes, device=self._device
+                    feats, self.topk, self._total_classes, device=self._device
                 )
                 y_pred.append(topk_pred)
                 y_true.append(targets.cpu().numpy())
@@ -1141,6 +1146,39 @@ class Learner(BaseLearner):
             logging.warning("No predictions generated from HC-SOINN evaluation")
             return np.array([]), np.array([])
 
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def _eval_hc_soinn_fc_fusion(self, loader):
+        """
+        Fusion experiment:
+        result = a * HC-SOINN + b * (Calibrated FC), where calibrated scores are probabilities.
+        """
+        self._network.eval()
+        y_pred, y_true = [], []
+        feature_fn = self._get_soinn_feature_fn()
+        eval_classes = self.init_cls if self.test_only_first_task_classes else self._total_classes
+
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                inputs = inputs.to(self._device)
+                fc_logits = self._network(inputs)[:, :eval_classes]
+                feats = feature_fn(inputs)
+                feats = F.normalize(feats, p=2, dim=1)
+                hc_logits = self.hc_soinn.predict_class_logits(
+                    feats, eval_classes, device=self._device
+                )
+
+                fc_probs = torch.softmax(fc_logits / self.hc_soinn_fc_calib_temp, dim=1)
+                hc_probs = torch.softmax(hc_logits / self.hc_soinn_hc_calib_temp, dim=1)
+                fused_probs = self.hc_soinn_fc_fusion_a * hc_probs + self.hc_soinn_fc_fusion_b * fc_probs
+
+                predicts = torch.topk(fused_probs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                y_pred.append(predicts.cpu().numpy())
+                y_true.append(targets.cpu().numpy())
+
+        if len(y_pred) == 0:
+            logging.warning("No predictions generated from HC-SOINN + FC fusion evaluation")
+            return np.array([]), np.array([])
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def eval_task(self):
@@ -1173,6 +1211,9 @@ class Learner(BaseLearner):
         if getattr(self, "use_hc_soinn", False):
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
+            if self.use_hc_soinn_fc_fusion:
+                y_pred_mix, y_true_mix = self._eval_hc_soinn_fc_fusion(self.test_loader)
+                results["hc_soinn_fc_fusion"] = self._evaluate(y_pred_mix, y_true_mix)
         elif getattr(self, "use_soinn", False):
             y_pred_soinn, y_true_soinn = self._eval_soinn(self.test_loader)
             results["soinn"] = self._evaluate(y_pred_soinn, y_true_soinn)
