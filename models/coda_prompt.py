@@ -6,6 +6,7 @@ from tqdm import tqdm
 from torch import optim
 from torch.optim import Optimizer
 import math
+import time
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from utils.inc_net import CodaPromptVitNet
@@ -16,6 +17,7 @@ from utils.soinn_classifier import SOINNClassifier
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
 from utils.STAR import STARAligner
+from utils.hc_soinn_node_stats import log_hc_soinn_dataset_end_summary
 from utils.storage_analyzer import StorageAnalyzer
 import os
 import matplotlib
@@ -89,6 +91,8 @@ class Learner(BaseLearner):
                 soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
                 coarse_topk=args.get("hcsoinn_coarse_topk", None),
+                enable_inference_profiling=args.get("hcsoinn_profile_inference", False),
+                profile_sync_cuda=args.get("hcsoinn_profile_sync_cuda", True),
             )
         elif self.use_soinn:
             # 处理 seed 参数：如果传入的是列表，取第一个元素
@@ -291,6 +295,9 @@ class Learner(BaseLearner):
         
         # 7. 更新已知类别数
         self._known_classes = self._total_classes
+
+        # HC-SOINN：全部任务结束时输出每类节点与均值（与 compute_avg_node_num 口径一致）
+        log_hc_soinn_dataset_end_summary(self)
         
         # 8. 存储占用分析（如果启用）
         if self.enable_storage_analysis:
@@ -1121,25 +1128,95 @@ class Learner(BaseLearner):
         self._network.eval()
         y_pred, y_true = [], []
         feature_fn = self._get_soinn_feature_fn()
+        profile_on = bool(self.args.get("hcsoinn_profile_inference", False))
+        profile_sync_cuda = bool(self.args.get("hcsoinn_profile_sync_cuda", True))
+
+        def _sync_if_needed():
+            if profile_on and profile_sync_cuda and self._device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device=self._device)
+
+        batch_count = 0
+        sample_count = 0
+        feature_extract_sec = 0.0
+        feature_to_numpy_sec = 0.0
+        hc_predict_sec = 0.0
+
+        if profile_on and hasattr(self.hc_soinn, "set_inference_profiling"):
+            self.hc_soinn.set_inference_profiling(True, reset=True, sync_cuda=profile_sync_cuda)
+
         with torch.no_grad():
             for _, (_, inputs, targets) in enumerate(loader):
                 inputs = inputs.to(self._device)
+
+                _sync_if_needed()
+                t0 = time.perf_counter()
                 feats = feature_fn(inputs)
+                _sync_if_needed()
+                feature_extract_sec += time.perf_counter() - t0
+
+                _sync_if_needed()
+                t0 = time.perf_counter()
                 feats = feats.detach().cpu()
                 if len(feats.shape) == 1:
                     feats = feats.reshape(1, -1)
                 elif len(feats.shape) != 2:
                     raise ValueError(f"Expected 2D features [B, D], got shape {feats.shape}")
                 feats_np = feats.numpy()
+                feature_to_numpy_sec += time.perf_counter() - t0
+
+                _sync_if_needed()
+                t0 = time.perf_counter()
                 topk_pred = self.hc_soinn.predict_topk(
                     feats_np, self.topk, self._total_classes, device=self._device
                 )
+                _sync_if_needed()
+                hc_predict_sec += time.perf_counter() - t0
+
                 y_pred.append(topk_pred)
                 y_true.append(targets.cpu().numpy())
+                batch_count += 1
+                sample_count += int(targets.shape[0])
 
         if len(y_pred) == 0:
             logging.warning("No predictions generated from HC-SOINN evaluation")
             return np.array([]), np.array([])
+
+        if profile_on:
+            total_eval_sec = feature_extract_sec + feature_to_numpy_sec + hc_predict_sec
+            logging.info("=" * 72)
+            logging.info(
+                f"[HC-SOINN Inference Profile] task={self._cur_task}, "
+                f"batches={batch_count}, samples={sample_count}, total={total_eval_sec:.6f}s"
+            )
+            if total_eval_sec > 0:
+                logging.info(
+                    f"  feature_extract: {feature_extract_sec:.6f}s "
+                    f"({feature_extract_sec / total_eval_sec * 100:.2f}%)"
+                )
+                logging.info(
+                    f"  feature_to_numpy: {feature_to_numpy_sec:.6f}s "
+                    f"({feature_to_numpy_sec / total_eval_sec * 100:.2f}%)"
+                )
+                logging.info(
+                    f"  hcsoinn_predict_topk: {hc_predict_sec:.6f}s "
+                    f"({hc_predict_sec / total_eval_sec * 100:.2f}%)"
+                )
+
+            if hasattr(self.hc_soinn, "get_profile_stats"):
+                profile = self.hc_soinn.get_profile_stats(reset=False)
+                calls = int(profile.get("calls", 0))
+                total_sec = float(profile.get("total_sec", 0.0))
+                logging.info(
+                    f"  predict_topk_internal: calls={calls}, total={total_sec:.6f}s, "
+                    f"avg/call={profile.get('avg_ms_per_call', 0.0):.3f}ms, "
+                    f"avg/sample={profile.get('avg_ms_per_sample', 0.0):.3f}ms"
+                )
+                step_sec = profile.get("steps_sec", {})
+                step_ratio = profile.get("steps_ratio", {})
+                for step_name, sec in step_sec.items():
+                    ratio = float(step_ratio.get(step_name, 0.0)) * 100.0
+                    logging.info(f"    - {step_name}: {sec:.6f}s ({ratio:.2f}%)")
+            logging.info("=" * 72)
 
         return np.concatenate(y_pred), np.concatenate(y_true)
 
@@ -1148,6 +1225,8 @@ class Learner(BaseLearner):
         评估任务：分别评估FC、KNN（如果启用）、NCM（如果启用）三种分类器
         返回所有分类器的精度结果
         """
+        eval_fc = bool(self.args.get("eval_fc", True))
+
         # 如果启用了knn_upperbound，在评估前重新构建KNN bank（使用最新的模型特征）
         if getattr(self, "use_knn", False) and getattr(self, "knn_upperbound", False):
             self._build_knn_bank_upperbound_at_eval()
@@ -1155,14 +1234,17 @@ class Learner(BaseLearner):
         results = {}
         
         # 1. 使用原始FC分类器评估（如果使用KAC，则评估KAC分类器）
-        if self.use_kac:
-            y_pred_kac, y_true_kac = self._eval_kac(self.test_loader)
-            results["kac"] = self._evaluate(y_pred_kac, y_true_kac)
-            # 同时保留fc结果（KAC分类器就是fc层）
-            results["fc"] = results["kac"]
+        if eval_fc:
+            if self.use_kac:
+                y_pred_kac, y_true_kac = self._eval_kac(self.test_loader)
+                results["kac"] = self._evaluate(y_pred_kac, y_true_kac)
+                # 同时保留fc结果（KAC分类器就是fc层）
+                results["fc"] = results["kac"]
+            else:
+                y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
+                results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
         else:
-            y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
-            results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
+            logging.info("Skipping FC evaluation (eval_fc=false)")
         
         # 2. 使用KNN分类器评估（如果启用）
         if getattr(self, "use_knn", False):

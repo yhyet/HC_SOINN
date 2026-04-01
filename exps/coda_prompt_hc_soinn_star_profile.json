@@ -1,5 +1,5 @@
 {
-    "prefix": "Trajectory_STAR_time",
+    "prefix": "Trajectory_STAR_profile",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -11,7 +11,7 @@
     "backbone_type": "vit_base_patch16_224_coda_prompt",
     "device": ["0"],
     "seed": [0],
-    
+
     "tuned_epoch": 1,
     "init_lr": 0.001,
     "batch_size": 128,
@@ -28,7 +28,8 @@
     "prompt_param": [100, 8.0, 0.0],
 
     "use_hc_soinn": true,
-    "hcsoinn_max_proto_per_class": 120,
+    "eval_fc": false,
+    "hcsoinn_max_proto_per_class": 60,
     "hcsoinn_alpha": 0.5,
     "hcsoinn_tau_merge": 0.2,
     "hcsoinn_tau_reject": 2.0,
@@ -39,12 +40,13 @@
     "hcsoinn_soinn_lam": 20,
     "hcsoinn_soinn_threshold_scale": 0.8,
     "hcsoinn_soinn_max_iter": 1,
+    "hcsoinn_profile_inference": true,
+    "hcsoinn_profile_sync_cuda": true,
 
     "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
     "checkpoint_name": "coda_prompt_hc_soinn_cifar",
     "load_all_checkpoints": false,
-
 
     "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
@@ -54,4 +56,3 @@
     "use_ncm": false,
     "visualize_tsne": false
 }
-

@@ -18,6 +18,7 @@ HC-SOINN 分类器（Hierarchical-Cluster SOINN）
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
+import time
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import cdist
 import logging
@@ -366,6 +367,8 @@ class HCSOINNClassifier:
         soinn_max_iter: int = 3,
         soinn_max_degree_for_removal: int = 1,
         coarse_topk: Optional[int] = None,
+        enable_inference_profiling: bool = False,
+        profile_sync_cuda: bool = True,
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -421,6 +424,14 @@ class HCSOINNClassifier:
         self._predict_cache_dirty: bool = True
         self._predict_cache: Dict[str, object] = {}
 
+        # ------------------------------------------------------------------ #
+        # Inference profiling (optional; focused on predict_topk internals)
+        # ------------------------------------------------------------------ #
+        self.enable_inference_profiling = bool(enable_inference_profiling)
+        self.profile_sync_cuda = bool(profile_sync_cuda)
+        self._profile_stats: Dict[str, object] = {}
+        self.reset_profile_stats()
+
     # ------------------------------------------------------------------ #
     # Cache helpers
     # ------------------------------------------------------------------ #
@@ -428,6 +439,68 @@ class HCSOINNClassifier:
         """Invalidate cached tensors used by predict_topk(). Safe to call often."""
         self._predict_cache_dirty = True
         self._predict_cache.clear()
+
+    # ------------------------------------------------------------------ #
+    # Inference profiling helpers
+    # ------------------------------------------------------------------ #
+    def reset_profile_stats(self) -> None:
+        self._profile_stats = {
+            "calls": 0,
+            "samples": 0,
+            "total_sec": 0.0,
+            "steps_sec": defaultdict(float),
+        }
+
+    def set_inference_profiling(
+        self,
+        enabled: bool,
+        reset: bool = False,
+        sync_cuda: Optional[bool] = None,
+    ) -> None:
+        self.enable_inference_profiling = bool(enabled)
+        if sync_cuda is not None:
+            self.profile_sync_cuda = bool(sync_cuda)
+        if reset:
+            self.reset_profile_stats()
+
+    def get_profile_stats(self, reset: bool = False) -> Dict[str, object]:
+        calls = int(self._profile_stats.get("calls", 0))
+        samples = int(self._profile_stats.get("samples", 0))
+        total_sec = float(self._profile_stats.get("total_sec", 0.0))
+        steps_raw = self._profile_stats.get("steps_sec", {})
+        steps_sec = {k: float(v) for k, v in sorted(steps_raw.items(), key=lambda x: x[1], reverse=True)}
+        out = {
+            "calls": calls,
+            "samples": samples,
+            "total_sec": total_sec,
+            "avg_ms_per_call": (total_sec / calls * 1000.0) if calls > 0 else 0.0,
+            "avg_ms_per_sample": (total_sec / samples * 1000.0) if samples > 0 else 0.0,
+            "steps_sec": steps_sec,
+            "steps_ratio": {k: (v / total_sec if total_sec > 0 else 0.0) for k, v in steps_sec.items()},
+        }
+        if reset:
+            self.reset_profile_stats()
+        return out
+
+    def _profile_sync(self, device: torch.device) -> None:
+        if (
+            self.enable_inference_profiling
+            and self.profile_sync_cuda
+            and isinstance(device, torch.device)
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize(device=device)
+
+    def _profile_tic(self, device: torch.device) -> float:
+        self._profile_sync(device)
+        return time.perf_counter()
+
+    def _profile_toc(self, step_name: str, t0: float, device: torch.device) -> float:
+        self._profile_sync(device)
+        dt = time.perf_counter() - t0
+        self._profile_stats["steps_sec"][step_name] += dt
+        return dt
 
     def _ensure_predict_cache(
         self,
@@ -763,6 +836,10 @@ class HCSOINNClassifier:
         if device is None:
             device = torch.device("cpu")
 
+        total_t0 = None
+        if self.enable_inference_profiling:
+            total_t0 = self._profile_tic(device)
+
         query_features = np.asarray(query_features, dtype=np.float32)
         query_dim = query_features.shape[1]
         
@@ -778,13 +855,22 @@ class HCSOINNClassifier:
         if not valid_classes:
             return np.zeros((query_features.shape[0], topk), dtype=np.int64)
 
+        stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
         query_t = torch.from_numpy(query_features).to(device=device, dtype=torch.float32)
+        if stage_t0 is not None:
+            self._profile_toc("query_to_device", stage_t0, device)
 
         # Build/reuse cached prototype tensors on the target device
+        stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
         self._ensure_predict_cache(device=device, query_dim=query_dim, valid_classes=valid_classes)
+        if stage_t0 is not None:
+            self._profile_toc("build_or_reuse_cache", stage_t0, device)
 
         # ---- Optimization: normalize query ONCE for the entire call ----
+        stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
         q_norm = torch.nn.functional.normalize(query_t, p=2, dim=1)  # [N, D]
+        if stage_t0 is not None:
+            self._profile_toc("normalize_query", stage_t0, device)
         
         # -----------------------------------------------------------
         # 辅助函数：计算距离 (支持 EASE Reweighting 或 标准 Cosine)
@@ -850,7 +936,10 @@ class HCSOINNClassifier:
         # -----------------------------------------------------------
         ncm_centers_t = self._predict_cache["ncm_centers_t"]
         
+        stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
         dist_ncm = compute_distance(ncm_centers_t)  # [N, C]
+        if stage_t0 is not None:
+            self._profile_toc("compute_ncm_distance", stage_t0, device)
         
         # -----------------------------------------------------------
         # 2. 计算 Sub-Cluster 距离 (with optional two-stage coarse filtering)
@@ -871,6 +960,7 @@ class HCSOINNClassifier:
 
         if use_coarse:
             # ---- Two-stage: NCM coarse filter → sub-cluster refine ----
+            stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
             _, coarse_indices = torch.topk(dist_ncm, k=coarse_k, dim=1, largest=False)  # [N, coarse_k]
             candidate_set = torch.unique(coarse_indices.reshape(-1))  # union across batch
 
@@ -895,9 +985,12 @@ class HCSOINNClassifier:
                     if mask.any():
                         min_d, _ = dist_filtered[:, mask].min(dim=1)
                         dist_sub[:, ci] = min_d
+            if stage_t0 is not None:
+                self._profile_toc("compute_subcluster_distance", stage_t0, device)
 
         else:
             # ---- Original: evaluate all prototypes ----
+            stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
             dist_proto_all = compute_distance(all_protos_t, proto_labels_t)  # [N, M]
 
             dist_sub = torch.full((N, C), float("inf"), device=device, dtype=dist_proto_all.dtype)
@@ -913,9 +1006,12 @@ class HCSOINNClassifier:
                         dist_sub[:, i] = min_d
                     else:
                         dist_sub[:, i] = dist_ncm[:, i]
+            if stage_t0 is not None:
+                self._profile_toc("compute_subcluster_distance", stage_t0, device)
         
         # 融合分数
         # score = alpha * d_ncm + (1 - alpha) * d_sub
+        stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
         final_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub
         
         # 直接 TopK
@@ -926,6 +1022,14 @@ class HCSOINNClassifier:
         # 转换回原始类别ID
         valid_classes_t = np.array(valid_classes)
         top_preds = valid_classes_t[indices]  # [N, topk]
+        if stage_t0 is not None:
+            self._profile_toc("fuse_and_topk", stage_t0, device)
+
+        if total_t0 is not None:
+            total_dt = self._profile_toc("predict_topk_total", total_t0, device)
+            self._profile_stats["calls"] += 1
+            self._profile_stats["samples"] += int(query_features.shape[0])
+            self._profile_stats["total_sec"] += total_dt
         
         return top_preds
 

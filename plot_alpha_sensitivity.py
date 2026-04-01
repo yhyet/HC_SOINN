@@ -4,12 +4,16 @@ import numpy as np
 
 def plot_alpha_sensitivity():
     """绘制hcsoinn_alpha参数敏感性分析折线图"""
-    
+    # 与论文图注一致：SimpleCIL 设定 + 数据集名（按需修改）
+    dataset_name = "CIFAR-100"  # e.g. "ImageNet-R", "CUB-200", etc.
+
     # 数据
     alpha_values = [0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]
     avg_acc = [89.34, 90.56, 91.17, 91.62, 91.23, 91.00, 90.55]
     last_acc = [85.11, 86.6, 87.13, 87.56, 87.31, 87.04, 86.21]
     
+    # avg_acc = [64.31, 68.17, 69.69, 69.97, 70.43, 69.40, 68.05]
+    # last_acc = [58.28, 62.02, 63.63, 63.93, 63.98, 63.00, 61.35]
     # 创建图形
     fig, ax = plt.subplots(figsize=(10, 10))
     
@@ -57,8 +61,15 @@ def plot_alpha_sensitivity():
     # 添加网格
     ax.grid(True, alpha=0.3, linestyle=':', linewidth=2)
     
-    # 调整布局
-    plt.tight_layout()
+    # 图注（caption）：任务设定 + 图中展示内容
+    caption = (
+        f"Setup: CODA-Prompt + HC-SOINN on {dataset_name}"
+    )
+    fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=24)
+
+    # 调整布局：rect 底部留白，避免 caption 被裁切
+    plt.tight_layout(rect=[0, 0.06, 1, 1])
+    
     
     # 保存图形
     output_filename = 'alpha_sensitivity_analysis.png'

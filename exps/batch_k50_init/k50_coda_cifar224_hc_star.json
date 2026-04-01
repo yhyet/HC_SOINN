@@ -1,5 +1,5 @@
 {
-    "prefix": "",
+    "prefix": "k50_init_STAR",
     "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -11,7 +11,6 @@
     "backbone_type": "vit_base_patch16_224_coda_prompt",
     "device": ["0"],
     "seed": [0],
-    
     "tuned_epoch": 20,
     "init_lr": 0.001,
     "batch_size": 128,
@@ -20,36 +19,31 @@
     "optimizer": "adam",
     "scheduler": "cosine",
     "reinit_optimizer": true,
-
     "pretrained": true,
     "drop": 0.0,
     "drop_path": 0.0,
-
     "prompt_param": [100, 8.0, 0.0],
-
-    "use_kac": true,
-    "kac_config": {
-        "grid_min": -2.0,
-        "grid_max": 2.0,
-        "num_grids": 16,
-        "spline_weight_init_scale": 0.1
-    },
-
+    "use_hc_soinn": true,
+    "hcsoinn_max_proto_per_class": 50,
+    "hcsoinn_alpha": 0.5,
+    "hcsoinn_tau_merge": 0.2,
+    "hcsoinn_tau_reject": 2.0,
+    "hcsoinn_linkage": "average",
+    "hcsoinn_distance": "cosine",
+    "hcsoinn_use_soinn_refinement": true,
+    "hcsoinn_soinn_ad": 20,
+    "hcsoinn_soinn_lam": 20,
+    "hcsoinn_soinn_threshold_scale": 0.8,
+    "hcsoinn_soinn_max_iter": 1,
     "save_checkpoint": false,
     "checkpoint_dir": "checkpoints",
-    "checkpoint_name": "coda_prompt_kac_cifar",
+    "checkpoint_name": "k50_coda_cifar224_hc_star",
     "load_all_checkpoints": false,
-
-    "use_feature_alignment": false,
+    "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
-    "test_only_first_task_classes": false,
-
-    "analyze_cluster_structure_drift": false,
-    "eval_fc": false
+    "star_mode": "trajectory",
+    "star_lambda": 1,
+    "enable_storage_analysis": false,
+    "use_ncm": false,
+    "visualize_tsne": false
 }
-
-
-
-
-
-
