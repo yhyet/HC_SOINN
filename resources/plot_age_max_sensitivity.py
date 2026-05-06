@@ -1,7 +1,4 @@
-"""
-HC-SOINN SOINN 边老化上限 age_max（代码中 hcsoinn_soinn_ad）敏感性；
-绘图风格对齐 plot_alpha_sensitivity.py。生成两张图：SimpleCIL+INR、CODA-Prompt+CIFAR。
-"""
+"""Core component."""
 from __future__ import annotations
 
 import matplotlib.font_manager as fm

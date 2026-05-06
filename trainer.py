@@ -29,7 +29,6 @@ def _train(args):
     if not os.path.exists(logs_name):
         os.makedirs(logs_name)
 
-    # 生成时间戳，格式：YYYYMMDD_HHMMSS
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logfilename = "logs/{}/{}/{}/{}/{}_{}_{}_{}".format(
         args["model_name"],
@@ -67,20 +66,16 @@ def _train(args):
     args["nb_tasks"] = data_manager.nb_tasks
     model = factory.get_model(args["model_name"], args)
 
-    # 支持多种分类器的精度曲线
     fc_curve = {"top1": [], "top5": []}
     knn_curve = {"top1": [], "top5": []}
     ncm_curve = {"top1": [], "top5": []}
-    soinn_curve = {"top1": [], "top5": []}
-    esoinn_curve = {"top1": [], "top5": []}
     hc_soinn_curve = {"top1": [], "top5": []}
-    fc_matrix, knn_matrix, ncm_matrix, soinn_matrix, esoinn_matrix, hc_soinn_matrix = [], [], [], [], [], []
+    fc_matrix, knn_matrix, ncm_matrix, hc_soinn_matrix = [], [], [], []
 
-    # 如果启用了自动加载所有checkpoint模式，从任务0开始遍历所有任务
     start_task = 0
     if args.get("load_all_checkpoints", False):
         logging.info("Auto-loading all checkpoints mode enabled: will load checkpoints for all tasks and skip training")
-        start_task = 0  # 从任务0开始，依次加载所有checkpoint
+        start_task = 0
 
     for task in range(start_task, data_manager.nb_tasks):
         logging.info("All params: {}".format(count_parameters(model._network)))
@@ -88,25 +83,21 @@ def _train(args):
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         
-        # 记录最后一个 task 的训练和测试时间
         is_last_task = (task == data_manager.nb_tasks - 1)
         train_time = None
         eval_time = None
         
         if is_last_task:
-            # 记录训练时间
             train_start = time.time()
             model.incremental_train(data_manager)
             train_end = time.time()
             train_time = train_end - train_start
             
-            # 记录测试时间
             eval_start = time.time()
             eval_results = model.eval_task()
             eval_end = time.time()
             eval_time = eval_end - eval_start
             
-            # 输出时间信息
             logging.info("=" * 60)
             logging.info("Last Task (Task {}) Time Statistics:".format(task))
             logging.info("  Training time: {:.2f} seconds ({:.2f} minutes)".format(train_time, train_time / 60))
@@ -119,7 +110,6 @@ def _train(args):
         
         model.after_task()
 
-        # 处理FC分类器的结果
         if "fc" in eval_results:
             fc_accy = eval_results["fc"]
             logging.info("FC: {}".format(fc_accy["grouped"]))
@@ -129,7 +119,6 @@ def _train(args):
             fc_curve["top1"].append(fc_accy["top1"])
             fc_curve["top5"].append(fc_accy["top5"])
 
-        # 处理KNN分类器的结果
         if "knn" in eval_results:
             knn_accy = eval_results["knn"]
             logging.info("KNN: {}".format(knn_accy["grouped"]))
@@ -139,7 +128,6 @@ def _train(args):
             knn_curve["top1"].append(knn_accy["top1"])
             knn_curve["top5"].append(knn_accy["top5"])
 
-        # 处理NCM分类器的结果
         if "ncm" in eval_results:
             ncm_accy = eval_results["ncm"]
             logging.info("NCM: {}".format(ncm_accy["grouped"]))
@@ -149,27 +137,6 @@ def _train(args):
             ncm_curve["top1"].append(ncm_accy["top1"])
             ncm_curve["top5"].append(ncm_accy["top5"])
 
-        # 处理SOINN分类器的结果
-        if "soinn" in eval_results:
-            soinn_accy = eval_results["soinn"]
-            logging.info("SOINN: {}".format(soinn_accy["grouped"]))
-            soinn_keys = [key for key in soinn_accy["grouped"].keys() if '-' in key]
-            soinn_values = [soinn_accy["grouped"][key] for key in soinn_keys]
-            soinn_matrix.append(soinn_values)
-            soinn_curve["top1"].append(soinn_accy["top1"])
-            soinn_curve["top5"].append(soinn_accy["top5"])
-
-        # 处理 ESOINN 分类器的结果
-        if "esoinn" in eval_results:
-            esoinn_accy = eval_results["esoinn"]
-            logging.info("ESOINN: {}".format(esoinn_accy["grouped"]))
-            esoinn_keys = [key for key in esoinn_accy["grouped"].keys() if '-' in key]
-            esoinn_values = [esoinn_accy["grouped"][key] for key in esoinn_keys]
-            esoinn_matrix.append(esoinn_values)
-            esoinn_curve["top1"].append(esoinn_accy["top1"])
-            esoinn_curve["top5"].append(esoinn_accy["top5"])
-
-        # 处理 HC-SOINN 分类器的结果
         if "hc_soinn" in eval_results:
             hc_soinn_accy = eval_results["hc_soinn"]
             logging.info("HC-SOINN: {}".format(hc_soinn_accy["grouped"]))
@@ -179,7 +146,6 @@ def _train(args):
             hc_soinn_curve["top1"].append(hc_soinn_accy["top1"])
             hc_soinn_curve["top5"].append(hc_soinn_accy["top5"])
 
-        # 统一输出所有分类器的精度曲线（只显示已启用的分类器）
         curves_to_log = []
         if "fc" in eval_results:
             curves_to_log.append(("FC", fc_curve))
@@ -187,10 +153,6 @@ def _train(args):
             curves_to_log.append(("KNN", knn_curve))
         if "ncm" in eval_results:
             curves_to_log.append(("NCM", ncm_curve))
-        if "soinn" in eval_results:
-            curves_to_log.append(("SOINN", soinn_curve))
-        if "esoinn" in eval_results:
-            curves_to_log.append(("ESOINN", esoinn_curve))
         if "hc_soinn" in eval_results:
             curves_to_log.append(("HC-SOINN", hc_soinn_curve))
 
@@ -198,7 +160,6 @@ def _train(args):
             logging.info("{} top1 curve: {}".format(name, curve["top1"]))
             logging.info("{} top5 curve: {}".format(name, curve["top5"]))
 
-        # 计算并输出平均精度
         avg_accs = []
         if "fc" in eval_results and len(fc_curve["top1"]) > 0:
             avg_fc = sum(fc_curve["top1"]) / len(fc_curve["top1"])
@@ -218,25 +179,13 @@ def _train(args):
             print('Average Accuracy (NCM):', avg_ncm)
             logging.info("Average Accuracy (NCM): {}".format(avg_ncm))
 
-        if "soinn" in eval_results and len(soinn_curve["top1"]) > 0:
-            avg_soinn = sum(soinn_curve["top1"]) / len(soinn_curve["top1"])
-            avg_accs.append(("SOINN", avg_soinn))
-            print('Average Accuracy (SOINN):', avg_soinn)
-            logging.info("Average Accuracy (SOINN): {}".format(avg_soinn))
-
-        if "esoinn" in eval_results and len(esoinn_curve["top1"]) > 0:
-            avg_esoinn = sum(esoinn_curve["top1"]) / len(esoinn_curve["top1"])
-            avg_accs.append(("ESOINN", avg_esoinn))
-            print('Average Accuracy (ESOINN):', avg_esoinn)
-            logging.info("Average Accuracy (ESOINN): {}".format(avg_esoinn))
-
         if "hc_soinn" in eval_results and len(hc_soinn_curve["top1"]) > 0:
             avg_hc_soinn = sum(hc_soinn_curve["top1"]) / len(hc_soinn_curve["top1"])
             avg_accs.append(("HC-SOINN", avg_hc_soinn))
             print('Average Accuracy (HC-SOINN):', avg_hc_soinn)
             logging.info("Average Accuracy (HC-SOINN): {}".format(avg_hc_soinn))
 
-        logging.info("")  # 空行分隔
+        logging.info("")
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:
         if len(fc_matrix) > 0:
@@ -269,26 +218,6 @@ def _train(args):
             print('Accuracy Matrix (NCM):')
             print(np_acctable)
             logging.info('Forgetting (NCM): {}'.format(forgetting))
-        if len(soinn_matrix) > 0:
-            np_acctable = np.zeros([task + 1, task + 1])
-            for idxx, line in enumerate(soinn_matrix):
-                idxy = len(line)
-                np_acctable[idxx, :idxy] = np.array(line)
-            np_acctable = np_acctable.T
-            forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
-            print('Accuracy Matrix (SOINN):')
-            print(np_acctable)
-            logging.info('Forgetting (SOINN): {}'.format(forgetting))
-        if len(esoinn_matrix) > 0:
-            np_acctable = np.zeros([task + 1, task + 1])
-            for idxx, line in enumerate(esoinn_matrix):
-                idxy = len(line)
-                np_acctable[idxx, :idxy] = np.array(line)
-            np_acctable = np_acctable.T
-            forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
-            print('Accuracy Matrix (ESOINN):')
-            print(np_acctable)
-            logging.info('Forgetting (ESOINN): {}'.format(forgetting))
         if len(hc_soinn_matrix) > 0:
             np_acctable = np.zeros([task + 1, task + 1])
             for idxx, line in enumerate(hc_soinn_matrix):

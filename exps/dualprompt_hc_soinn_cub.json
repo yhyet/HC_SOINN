@@ -48,7 +48,6 @@
     "use_feature_alignment": false,
     "analyze_cluster_structure_drift": false,
     "test_only_first_task_classes": false,
-    "star_mode": "trajectory",
     "star_lambda": 1,
 
 

@@ -1,10 +1,4 @@
-"""
-Cluster Structure Analyzer - 簇结构分析模块 (修正版: 移除归一化)
-
-修正说明：
-1. 移除了 save_task1_samples 和 compute_procrustes_distances 中的 L2 Normalization。
-2. _compute_procrustes_distance 增加了缩放因子 s 的计算，以支持带缩放的刚性对齐。
-"""
+"""Core component."""
 
 import logging
 import numpy as np
@@ -16,9 +10,7 @@ import csv
 
 
 class ClusterStructureAnalyzer:
-    """
-    簇结构分析器
-    """
+    """Handle init."""
     
     def __init__(
         self,
@@ -73,11 +65,8 @@ class ClusterStructureAnalyzer:
             images_tensor = torch.stack(images_dict[cls])
             feats_array = np.array(feats_dict[cls])
             
-            # 【修正】直接保存原始特征，不进行归一化
             # feats_array_norm = feats_array / (np.linalg.norm(feats_array, axis=1, keepdims=True) + 1e-8)
             
-            # 【关键修复】使用 copy() 确保 feats_task1 不会被意外修改
-            # 如果直接赋值，如果某个地方修改了数组，会影响保存的值
             self._cluster_samples[cls] = {
                 'images': images_tensor,
                 'feats_task1': feats_array.copy()  # Raw features (deep copy to prevent accidental modification)
@@ -111,8 +100,6 @@ class ClusterStructureAnalyzer:
             
             feats_current = np.concatenate(feats_current, axis=0)
             
-            # 【调试】验证特征是否真的不同
-            # 检查 feats_task1 和 feats_current 的第一个样本的第一个特征值
             if len(feats_task1) > 0 and len(feats_current) > 0:
                 feat1_first_val = feats_task1[0, 0] if feats_task1.ndim > 1 else feats_task1[0]
                 feat_curr_first_val = feats_current[0, 0] if feats_current.ndim > 1 else feats_current[0]
@@ -121,7 +108,6 @@ class ClusterStructureAnalyzer:
                 feat_curr_mean = np.mean(feats_current)
                 feat_mean_diff = np.abs(feat1_mean - feat_curr_mean)
                 
-                # 检查是否完全相同（考虑浮点误差）
                 are_identical = np.allclose(feats_task1, feats_current, rtol=1e-8, atol=1e-8)
                 
                 
@@ -133,10 +119,8 @@ class ClusterStructureAnalyzer:
                         f"or feature_extractor is not using the current task's model weights."
                     )
             
-            # 【修正】不进行归一化
             # feats_current_norm = feats_current / (np.linalg.norm(feats_current, axis=1, keepdims=True) + 1e-8)
             
-            # 计算带 Scale 的 Procrustes 距离
             procrustes_dist, scale, angle_rad = self._compute_procrustes_distance(feats_task1, feats_current)
             self._procrustes_distances[cur_task][cls] = procrustes_dist
             
@@ -164,26 +148,20 @@ class ClusterStructureAnalyzer:
         self._save_procrustes_results()
     
     def _compute_procrustes_distance(self, X1: np.ndarray, X2: np.ndarray) -> Tuple[float, float, float]:
-        """
-        计算原始空间中的广义 Procrustes 距离 (包含 Scale)
-        返回: (Distance, Scale, Rotation_Angle_Estimate)
-        """
+        """Handle compute procrustes distance."""
         if X1.shape != X2.shape:
             raise ValueError(f"Shape mismatch: X1 {X1.shape} vs X2 {X2.shape}")
         if X1.shape[0] < 2:
             return 0.0, 1.0, 0.0
         
-        # 【调试】检查输入是否完全相同
         are_inputs_identical = np.allclose(X1, X2, rtol=1e-8, atol=1e-8)
         
-        # 1. 去中心化
         mu1 = X1.mean(axis=0)
         mu2 = X2.mean(axis=0)
         X1_centered = X1 - mu1
         X2_centered = X2 - mu2
         
         
-        # 2. 计算旋转 R
         M = np.dot(X1_centered.T, X2_centered)
         U, S, Vt = np.linalg.svd(M, full_matrices=False)
         R = np.dot(U, Vt)
@@ -193,31 +171,22 @@ class ClusterStructureAnalyzer:
             R = np.dot(U, Vt)
             det_R_after = np.linalg.det(R)
             
-        # 3. 计算缩放 s
         # s = trace(X2_centered.T @ X1_centered @ R) / trace(X1_centered.T @ X1_centered)
         # trace(A @ B) = sum(elementwise_multiplication)
         numerator = np.sum(S) # trace(S) comes from SVD
         denominator = np.sum(X1_centered ** 2)
         s = numerator / (denominator + 1e-8)
         
-        # 4. 对齐: Y_aligned = s * (X1 - mu1) @ R + mu2
-        # 我们比较 X2 和 对齐后的 X1
-        # 在中心化空间比较即可: X2_c vs s * X1_c @ R
         X1_transformed = s * np.dot(X1_centered, R)
         residual = X2_centered - X1_transformed
         
-        # 5. 计算距离 (归一化以便跨任务比较)
-        # 通常除以 sqrt(N) 或 原始数据的范数
-        norm_factor = np.sqrt(np.sum(X2_centered**2)) + 1e-8 # 相对于目标数据的 Scale 归一化
-        # 或者使用绝对 MSE: np.sqrt(np.mean(residual**2))
+        norm_factor = np.sqrt(np.sum(X2_centered**2)) + 1e-8
         residual_norm = np.linalg.norm(residual, ord='fro')
         procrustes_dist = residual_norm / norm_factor
         
-        # 如果距离为 0，跳过详细输出
         if procrustes_dist < 1e-6:
             pass  # Debug logging removed
         
-        # 6. 估算旋转角度 (参考)
         trace_R = np.trace(R)
         D = X1.shape[1]
         # cos(theta) = (Tr(R) - (D-2)) / 2  [Approx for high dim]

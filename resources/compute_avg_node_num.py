@@ -3,19 +3,10 @@ import sys
 from pathlib import Path
 
 def extract_node_counts_from_log(log_file_path):
-    """
-    从日志文件中提取HC-SOINN的节点数量
-    
-    Args:
-        log_file_path: 日志文件路径
-        
-    Returns:
-        tuple: (节点数量列表, 类别总数)
-    """
+    """Handle extract node counts from log."""
     node_counts = []
     total_classes = 0
     
-    # 尝试多种编码格式
     encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1', 'cp1252']
     file_content = None
     
@@ -28,39 +19,26 @@ def extract_node_counts_from_log(log_file_path):
             continue
     
     if file_content is None:
-        # 如果所有编码都失败，使用二进制模式读取
         with open(log_file_path, 'rb') as f:
             file_content = f.read().decode('utf-8', errors='ignore').splitlines()
     
     for line in file_content:
-        # 提取节点数量：匹配 "soinn_refined=数字"
         match = re.search(r'soinn_refined=(\d+)', line)
         if match:
             node_count = int(match.group(1))
             node_counts.append(node_count)
         
-        # 尝试从最后任务中提取总类别数
-        # 匹配 "Task X, Epoch" 或 "total classes: X"
         class_match = re.search(r'total classes:\s*(\d+)', line)
         if class_match:
             total_classes = max(total_classes, int(class_match.group(1)))
     
-    # 如果没有找到total classes，使用节点数量作为类别数
     if total_classes == 0:
         total_classes = len(node_counts)
     
     return node_counts, total_classes
 
 def compute_avg_nodes_per_class(log_file_path):
-    """
-    计算HC-SOINN的平均节点数（每个类别的平均节点数）
-    
-    Args:
-        log_file_path: 日志文件路径
-        
-    Returns:
-        dict: 包含统计信息的字典
-    """
+    """Handle compute avg nodes per class."""
     node_counts, total_classes = extract_node_counts_from_log(log_file_path)
     
     if len(node_counts) == 0:
@@ -79,19 +57,18 @@ def compute_avg_nodes_per_class(log_file_path):
         'total_classes': total_classes,
         'classes_with_nodes': len(node_counts),
         'total_nodes': total_nodes,
-        'avg_nodes_per_class_with_data': avg_nodes,  # 有数据的类的平均节点数
-        'avg_nodes_per_class': avg_nodes_per_class,  # 所有类的平均节点数（除以总类别数）
+        'avg_nodes_per_class_with_data': avg_nodes,
+        'avg_nodes_per_class': avg_nodes_per_class,
         'min_nodes': min(node_counts),
         'max_nodes': max(node_counts),
         'node_counts': node_counts
     }
 
 def main():
-    """主函数：支持命令行参数或交互式输入"""
+    """Handle main."""
     if len(sys.argv) > 1:
         log_file_path = Path(sys.argv[1])
     else:
-        # 交互式输入
         log_file_input = input("请输入日志文件路径: ").strip()
         log_file_path = Path(log_file_input)
     
@@ -120,10 +97,7 @@ def main():
     print(f"\n每个类别的节点数: {result['node_counts']}")
 
 def summarize_hc_soinn_from_classifier(hc_soinn):
-    """
-    从运行中的 HCSOINNClassifier 得到与本脚本相同的统计口径（每类节点数列表、均值等）。
-    实现位于 utils.hc_soinn_node_stats，供 CodaPrompt / SEMA / DualPrompt 等在数据集结束时打 log。
-    """
+    """Handle summarize hc soinn from classifier."""
     from utils.hc_soinn_node_stats import summarize_hc_soinn_classifier
     return summarize_hc_soinn_classifier(hc_soinn)
 

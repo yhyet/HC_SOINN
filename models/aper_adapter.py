@@ -54,13 +54,10 @@ class Learner(BaseLearner):
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
         
-        # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
         self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
-        self.cluster_analyzer = None  # 簇结构分析器（延迟初始化）
+        self.cluster_analyzer = None
         
         if self.analyze_cluster_structure_drift:
-            logging.info("簇结构分析实验启用：将计算Procrustes距离验证特征漂移时簇结构是否改变")
-            # 定义特征提取函数（适配 SimpleVitNet 的网络结构）
             def feature_extractor(x):
                 if isinstance(self._network, nn.DataParallel):
                     feats = self._network.module.extract_vector(x)
@@ -74,21 +71,12 @@ class Learner(BaseLearner):
                 args=args
             )
         
-        # NCM分类器：初始化类均值存储
         self._class_means = None
 
     def after_task(self):
-        """
-        每个 task 结束后的处理流程
-        
-        【Pipeline 流程说明】
-        1. 簇结构分析实验：保存Task 1样本或计算Procrustes距离
-        2. 更新已知类别数
-        """
-        # ========== Step 1: 簇结构分析实验：保存Task 1样本或计算Procrustes距离==========
+        """Handle after task."""
         if self.cluster_analyzer is not None:
             if self._cur_task == 0:
-                # Task 1结束后：保存所有训练样本
                 init_cls = self.args.get("init_cls", 10)
                 dataset_loader = lambda: self.data_manager.get_dataset(
                     np.arange(0, init_cls), source="train", mode="test"
@@ -99,10 +87,8 @@ class Learner(BaseLearner):
                     num_workers=num_workers
                 )
             else:
-                # 后续任务：计算Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
         
-        # ========== Step 2: 更新已知类别数 ==========
         self._known_classes = self._total_classes
     
     def replace_fc(self,trainloader, model, args):
@@ -158,7 +144,6 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         
-        # 训练结束后，统一构建所有分类器（HC-SOINN等）
         self._build_classifiers()
 
     def _train(self, train_loader, test_loader, train_loader_for_protonet):
@@ -230,9 +215,7 @@ class Learner(BaseLearner):
         logging.info(info)
 
     def _get_hc_soinn_feature_fn(self):
-        """
-        获取HC-SOINN特征提取函数（统一特征提取逻辑）
-        """
+        """Handle feature fn."""
         def feature_fn(x):
             if isinstance(self._network, nn.DataParallel):
                 feats = self._network.module.extract_vector(x)
@@ -252,29 +235,19 @@ class Learner(BaseLearner):
         return feature_fn
 
     def _build_classifiers(self):
-        """
-        统一构建所有分类器（在训练结束后、测试开始前调用）
-        包括：HC-SOINN bank
-        无论是正常训练还是加载checkpoint，都在这里统一构建
-        """
+        """Handle build classifiers."""
         logging.info(f"Building classifiers for task {self._cur_task} (total classes: {self._total_classes})")
         
-        # 确保模型在正确的设备上并处于eval模式
         self._network.to(self._device)
         self._network.eval()
         
-        # ========== Step 1: 构建 HC-SOINN bank ==========
         if getattr(self, "use_hc_soinn", False):
             self._build_hc_soinn_bank()
         
         logging.info("All classifiers built successfully")
     
     def _build_hc_soinn_bank(self):
-        """
-        构建 HC-SOINN bank：类增量学习场景下的累积存储
-        - 每个任务只使用当前任务的新类别训练数据（符合类增量学习设定）
-        - 旧类别的信息通过已保存的簇中心保留（在 compress 时合并）
-        """
+        """Handle build hc soinn bank."""
         hc_bank_empty = (not hasattr(self, "hc_soinn")) or (len(getattr(self.hc_soinn, "class_clusters", {})) == 0)
         if hc_bank_empty:
             logging.info(f"HC-SOINN bank is empty!!!")
@@ -296,7 +269,6 @@ class Learner(BaseLearner):
             lbs_np = np.concatenate(lbs, axis=0)
             self.hc_soinn.add_features(feats_np, lbs_np)
 
-        # 类增量学习：每个任务只使用当前任务的新类别训练数据
         logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
         current_task_dataset = self.data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes), source="train", mode="test"
@@ -310,14 +282,13 @@ class Learner(BaseLearner):
         )
         add_from_loader(current_task_loader)
 
-        # 每个任务结束后压缩一次
         try:
             self.hc_soinn.compress()
         except Exception as e:
             logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
 
     def _eval_hc_soinn(self, loader):
-        """使用 HC-SOINN 分类器进行评估"""
+        """Handle eval hc soinn."""
         self._network.eval()
         y_pred, y_true = [], []
         feature_fn = self._get_hc_soinn_feature_fn()
@@ -344,17 +315,12 @@ class Learner(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def eval_task(self):
-        """
-        评估任务：分别评估FC、HC-SOINN（如果启用）分类器
-        返回所有分类器的精度结果
-        """
+        """Handle eval task."""
         results = {}
         
-        # 1. 使用原始FC分类器评估
         y_pred_fc, y_true_fc = self._eval_fc(self.test_loader)
         results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
         
-        # 2. 使用 HC-SOINN 分类器评估（如果启用）
         if getattr(self, "use_hc_soinn", False):
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
@@ -362,7 +328,7 @@ class Learner(BaseLearner):
         return results
     
     def _eval_fc(self, loader):
-        """使用原始FC层进行评估"""
+        """Handle eval fc."""
         self._network.eval()
         y_pred, y_true = [], []
         

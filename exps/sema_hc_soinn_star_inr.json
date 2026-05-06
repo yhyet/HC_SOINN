@@ -51,7 +51,6 @@
 
     "use_feature_alignment": true,
     "use_full_task_rehearsal": false,
-    "star_mode": "trajectory",
     "star_lambda": 1
 }
 

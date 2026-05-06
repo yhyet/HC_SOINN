@@ -1,14 +1,10 @@
-"""
-DualPrompt 下 EMA / STAR 轨迹混合权重 λ（star_lambda）敏感性；
-绘图风格对齐 plot_alpha_sensitivity.py。
-"""
+"""Core component."""
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import numpy as np
 
 
 def plot_lambda_sensitivity():
-    # 物理取值 λ：从左到右 1 → 0.9 递减
     lambda_values = [1.0, 0.999, 0.99, 0.95, 0.9]
     avg_acc = [92.60, 92.60, 92.60, 92.62, 92.63]
     last_acc = [89.15, 89.15, 89.16, 89.22, 89.23]

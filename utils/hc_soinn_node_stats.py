@@ -1,4 +1,4 @@
-"""HC-SOINN 节点统计：与 `compute_avg_node_num.py` 日志解析口径一致（每类精炼后节点数）。"""
+"""Core component."""
 
 from __future__ import annotations
 
@@ -7,13 +7,7 @@ from typing import Any, Dict, List, Optional
 
 
 def summarize_hc_soinn_classifier(hc_soinn) -> Optional[Dict[str, Any]]:
-    """
-    从 HCSOINNClassifier 当前内存状态统计每类节点数（len(class_clusters[c])），
-    对应日志里每条 ``soinn_refined=`` 的语义。
-
-    Returns:
-        与 ``compute_avg_nodes_per_class`` 相近的 dict；无有效数据时 None。
-    """
+    """Handle summarize hc soinn classifier."""
     if hc_soinn is None:
         return None
     if not hasattr(hc_soinn, "class_mu") or not hc_soinn.class_mu:
@@ -48,10 +42,7 @@ def summarize_hc_soinn_classifier(hc_soinn) -> Optional[Dict[str, Any]]:
 
 
 def log_hc_soinn_dataset_end_summary(learner) -> None:
-    """
-    在增量学习**最后一个 task** 的 ``after_task`` 末尾调用：
-    若启用 ``use_hc_soinn``，将平均节点数等写入 logging（与 compute_avg_node_num 脚本对齐的指标）。
-    """
+    """Handle log hc soinn dataset end summary."""
     if not getattr(learner, "use_hc_soinn", False):
         return
     dm = getattr(learner, "data_manager", None)

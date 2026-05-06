@@ -512,14 +512,12 @@ class VisionTransformer(nn.Module):
         # Classifier Head
         self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
         
-        # KAC分类器支持
         self.use_kac = use_kac
         if kac_config is None:
             kac_config = {}
-        self.kac_config = kac_config  # 保存KAC配置（用于reset_classifier）
+        self.kac_config = kac_config
         
         if self.use_kac:
-            # 使用KAC分类器
             self.head = KACLayer(
                 input_dim=self.embed_dim,
                 output_dim=num_classes,
@@ -529,7 +527,6 @@ class VisionTransformer(nn.Module):
                 spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
             ) if num_classes > 0 else nn.Identity()
         else:
-            # 使用标准线性分类器
             self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if weight_init != 'skip':
@@ -576,13 +573,10 @@ class VisionTransformer(nn.Module):
             assert global_pool in ('', 'avg', 'token')
             self.global_pool = global_pool
         
-        # KAC分类器支持
         if self.use_kac:
-            # 如果已有KAC分类器，使用update方法扩展
             if hasattr(self.head, 'update') and num_classes > 0:
                 self.head.update(num_classes)
             else:
-                # 重新创建KAC分类器
                 kac_config = getattr(self, 'kac_config', {})
                 if kac_config is None:
                     kac_config = {}
@@ -595,7 +589,6 @@ class VisionTransformer(nn.Module):
                     spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
                 ) if num_classes > 0 else nn.Identity()
         else:
-            # 使用标准线性分类器
             self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x, task_id=-1, cls_features=None, train=False):
@@ -680,7 +673,7 @@ class VisionTransformer(nn.Module):
         res['pre_logits'] = x
 
         x = self.fc_norm(x)
-        res['features'] = x  # 保存 norm 后的特征用于 NCM/HC-SOINN
+        res['features'] = x
         
         res['logits'] = self.head(x)
         

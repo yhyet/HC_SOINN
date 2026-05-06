@@ -1,19 +1,4 @@
-"""
-HC-SOINN 分类器（Hierarchical-Cluster SOINN）
-
-- 使用 NCM 维护全局类中心 mu_c（增量均值）
-- 类内先做层次聚类得到簇中心，然后在簇中心上应用 SOINN 自组织机制
-- 推理时：先看 NCM，再结合最近子簇中心做融合距离
-
-设计思路：
-- 层次聚类先过滤噪声，得到代表性簇中心
-- 在簇中心上应用简化版 SOINN 自组织网络，进行增量学习和动态调整
-- 这样既利用了层次聚类的去噪能力，又保留了 SOINN 的自适应特性
-
-优化：
-- 推理加速：predict_topk 使用 GPU 矩阵运算替代 Python 循环
-- 压缩加速：compress 使用 ProcessPoolExecutor 多进程并行处理各类聚类
-"""
+"""Core component."""
 
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
@@ -42,30 +27,22 @@ def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
 
 class _Cluster:
     def __init__(self, center: np.ndarray, count: int, center_raw: Optional[np.ndarray] = None):
-        """
-        center: 归一化中心 (用于推理)
-        center_raw: 未归一化中心 (用于 STAR 对齐)
-        """
+        """Handle init."""
         self.center = _normalize(center)
         self.count = int(count)
-        # 关键修复：如果提供了 raw，直接使用；否则仅当 center 本身未归一化时才复制
         if center_raw is not None:
             self.center_raw = center_raw.copy()
         else:
-            # Fallback: 假设 center 就是 raw (但在 compress 中我们会强制提供 raw)
             self.center_raw = center.copy()
             
 def _hierarchical_cluster(feats_norm: np.ndarray, feats_raw: np.ndarray, target_k: int, linkage_method: str, distance_metric: str) -> List[_Cluster]:
-    """
-    修改版：同时接收归一化特征（用于聚类计算）和原始特征（用于计算 center_raw）
-    """
+    """Handle hierarchical cluster."""
     if feats_norm.shape[0] == 0:
         return []
     if feats_norm.shape[0] <= target_k:
         return [_Cluster(feats_norm[i], 1, center_raw=feats_raw[i]) for i in range(feats_norm.shape[0])]
 
     try:
-        # 使用归一化特征进行距离计算和聚类
         Z = linkage(feats_norm, method=linkage_method, metric=distance_metric)
         cluster_ids = fcluster(Z, t=target_k, criterion="maxclust")
     except Exception:
@@ -83,19 +60,14 @@ def _hierarchical_cluster(feats_norm: np.ndarray, feats_raw: np.ndarray, target_
         vectors = np.stack(clusters_map[cid])
         vectors_raw = np.stack(clusters_raw_map[cid])
         
-        # 计算归一化中心
         center = vectors.mean(axis=0)
-        # 计算原始中心 (保留 Magnitude 信息)
         center_raw = vectors_raw.mean(axis=0)
         
         out.append(_Cluster(center, vectors.shape[0], center_raw=center_raw))
     return out
 
 def _merge_close_clusters(clusters: List[_Cluster], tau: float) -> List[_Cluster]:
-    """
-    按阈值合并距离过近的簇（余弦距离）
-    当 use_soinn_refinement=False 时使用
-    """
+    """Handle merge close clusters."""
     if len(clusters) <= 1:
         return clusters
 
@@ -113,7 +85,6 @@ def _merge_close_clusters(clusters: List[_Cluster], tau: float) -> List[_Cluster
             if dmat[i, j] <= tau:
                 merged[j] = True
                 close_idxs.append(j)
-        # 合并 close_idxs (both normalized and raw centers)
         total_count = sum(clusters[k].count for k in close_idxs)
         weighted_center = sum(clusters[k].center * clusters[k].count for k in close_idxs) / float(
             max(total_count, 1)
@@ -127,9 +98,7 @@ def _merge_close_clusters(clusters: List[_Cluster], tau: float) -> List[_Cluster
 
 
 def _spherical_interpolate(v1: np.ndarray, v2: np.ndarray, t: float) -> np.ndarray:
-    """
-    球面线性插值（SLERP）在单位球面上
-    """
+    """Handle spherical interpolate."""
     v1_norm = _normalize(v1)
     v2_norm = _normalize(v2)
     
@@ -157,20 +126,16 @@ def _simplified_soinn_on_clusters(
     max_iterations: int = 3,
     max_degree_for_removal: int = 1,
 ) -> List[_Cluster]:
-    """
-    修改版：在 SOINN 调整 normalized 节点位置时，同步线性更新 raw 节点位置
-    """
+    """Handle simplified soinn on clusters."""
     if len(cluster_centers) == 0:
         return [], {}
     
-    # 初始化节点
     nodes = [_normalize(c.copy()) for c in cluster_centers]
-    nodes_raw = [c.copy() for c in cluster_centers_raw] # 同步维护 Raw 节点
+    nodes_raw = [c.copy() for c in cluster_centers_raw]
     
     win_counts = cluster_counts.copy()
     edges = defaultdict(dict)
     
-    # 初始化边
     n_nodes = len(nodes)
     if n_nodes >= 2:
         for i in range(n_nodes):
@@ -180,7 +145,6 @@ def _simplified_soinn_on_clusters(
                 edges[i][nearest_idx] = 0
                 edges[nearest_idx][i] = 0
     
-    # 原始簇中心作为输入信号 (Input Signals)
     input_signals = list(zip(cluster_centers, cluster_centers_raw))
     
     # IMPORTANT (Determinism):
@@ -204,20 +168,15 @@ def _simplified_soinn_on_clusters(
             
             if len(nodes) < 2: continue
             
-            # 1. 寻找 Winner
             dists = np.array([_cosine_distance(x_norm, w) for w in nodes])
             sorted_idx = np.argsort(dists)
             s1, s2 = sorted_idx[0], sorted_idx[1]
             
-            # 2. 阈值判断 (省略细节，保持原逻辑)
-            # ... (保持原有的阈值计算和插入判断逻辑) ...
             
-            # 3. 建立边
             if s2 not in edges[s1]:
                 edges[s1][s2] = 0
                 edges[s2][s1] = 0
             
-            # 4. 边老化
             for nbr in list(edges[s1].keys()):
                 edges[s1][nbr] += 1
                 if s1 in edges[nbr]: edges[nbr][s1] = edges[s1][nbr]
@@ -225,15 +184,11 @@ def _simplified_soinn_on_clusters(
                     del edges[s1][nbr]
                     if s1 in edges[nbr]: del edges[nbr][s1]
             
-            # 5. 更新节点位置 (核心修改)
-            # 学习率
             eta1 = 1.0 / float(t + iteration * len(input_signals) + 1)
             eta2 = 1.0 / (100.0 * float(t + iteration * len(input_signals) + 1))
             
-            # A. 归一化空间：使用 SLERP
             nodes[s1] = _spherical_interpolate(nodes[s1], x_norm, eta1)
             
-            # B. 原始空间：使用线性插值 (Standard Hebbian Learning)
             # w_raw += eta * (x_raw - w_raw)
             nodes_raw[s1] = nodes_raw[s1] + eta1 * (x_raw - nodes_raw[s1])
             
@@ -243,15 +198,11 @@ def _simplified_soinn_on_clusters(
                 
             win_counts[s1] += 1
 
-        # 删除孤立节点逻辑 (保持不变，但在重建列表时要同步处理 nodes_raw)
         # ...
-        # (为节省篇幅，这里简略，实现时请确保 nodes_raw 与 nodes 同步增删)
-        # 简单实现：
         to_remove = [i for i in range(len(nodes)) if len(edges[i]) <= max_degree_for_removal]
         if len(to_remove) > 0 and len(nodes) - len(to_remove) >= 2:
             keep_mask = [i not in to_remove for i in range(len(nodes))]
             
-            # 重建映射
             old_to_new = {}
             new_nodes, new_nodes_raw, new_counts = [], [], []
             for old_idx, keep in enumerate(keep_mask):
@@ -261,7 +212,6 @@ def _simplified_soinn_on_clusters(
                     new_nodes_raw.append(nodes_raw[old_idx])
                     new_counts.append(win_counts[old_idx])
             
-            # 重建边
             new_edges = defaultdict(dict)
             for old_i, nbrs in edges.items():
                 if old_i in old_to_new:
@@ -272,7 +222,6 @@ def _simplified_soinn_on_clusters(
             
             nodes, nodes_raw, win_counts, edges = new_nodes, new_nodes_raw, new_counts, new_edges
             
-            # 修复连通性 (若删完后有新孤立点)
             for i in range(len(nodes)):
                 if len(edges[i]) == 0 and len(nodes) > 1:
                     dists = [_cosine_distance(nodes[i], nodes[j]) if i != j else float('inf') for j in range(len(nodes))]
@@ -280,49 +229,42 @@ def _simplified_soinn_on_clusters(
                     edges[i][nearest] = 0
                     edges[nearest][i] = 0
 
-    # 最终结果
     result = []
-    final_edges_map = {} # 映射回 0..N
+    final_edges_map = {}
     
-    # 再次清理完全孤立点
     final_indices = [i for i in range(len(nodes)) if len(edges[i]) > 0]
-    if not final_indices: final_indices = range(len(nodes)) # 防止空
+    if not final_indices: final_indices = range(len(nodes))
     
     for new_idx, old_idx in enumerate(final_indices):
         result.append(_Cluster(nodes[old_idx], win_counts[old_idx], center_raw=nodes_raw[old_idx]))
         final_edges_map[new_idx] = set()
         for nbr in edges[old_idx]:
              if nbr in final_indices:
-                 # 找到 nbr 在 final_indices 中的新索引 (效率较低但数据量小)
                  final_edges_map[new_idx].add(final_indices.index(nbr))
                  
     return result, final_edges_map
 
 def _compress_class_worker(args):
-    # ... (前置导入保持不变)
     
     (cls, feats, target_k, tau_merge, linkage_method, distance_metric, max_prototypes,
      use_soinn_refinement, soinn_ad, soinn_lam, soinn_threshold_scale, soinn_max_iter,
      soinn_max_degree_for_removal) = args
     
-    # 关键修改 1: 保留原始特征，另外计算归一化特征
     feats_raw = feats.astype(np.float32)
     feats_norm = feats_raw / (np.linalg.norm(feats_raw, axis=1, keepdims=True) + 1e-8)
     
-    # 关键修改 2: 传递两者给聚类函数
     clusters = _hierarchical_cluster(feats_norm, feats_raw, target_k, linkage_method, distance_metric)
     hierarchical_count = len(clusters)
     
     soinn_edges = {}
     if use_soinn_refinement and len(clusters) > 1:
         cluster_centers = [c.center for c in clusters]
-        # 关键修改 3: 提取 raw centers 传给 SOINN
         cluster_centers_raw = [c.center_raw for c in clusters] 
         cluster_counts = [c.count for c in clusters]
         
         clusters, soinn_edges = _simplified_soinn_on_clusters(
             cluster_centers,
-            cluster_centers_raw, # 传入
+            cluster_centers_raw,
             cluster_counts,
             ad=soinn_ad,
             lam=soinn_lam,
@@ -331,26 +273,19 @@ def _compress_class_worker(args):
             max_degree_for_removal=soinn_max_degree_for_removal,
         )
     else:
-        # Merge close logic 也可以相应修改，或者暂时忽略（因为主要用 SOINN）
-        # 如果必须用，记得 merge 时也要加权平均 center_raw
-        clusters = sorted(clusters, key=lambda c: c.count, reverse=True) # 简单排序
+        clusters = sorted(clusters, key=lambda c: c.count, reverse=True)
     
-    # ... (后处理保持不变)
     
-    # Debug log (检查 Norm 是否恢复正常)
     if len(clusters) > 0:
         raw_norms = [np.linalg.norm(c.center_raw) for c in clusters]
         avg_raw_norm = sum(raw_norms) / len(raw_norms)
-        # 如果 avg_raw_norm 接近 1.0，说明还是有问题；应该接近 10-20
         # print(f"DEBUG WORKER {cls}: Avg Raw Norm = {avg_raw_norm:.4f}")
 
     final_count = len(clusters)
     return cls, clusters, hierarchical_count, final_count, soinn_edges
 
 class HCSOINNClassifier:
-    """
-    Hierarchical-Cluster SOINN 分类器
-    """
+    """Handle init."""
 
     def __init__(
         self,
@@ -379,7 +314,6 @@ class HCSOINNClassifier:
         self.linkage_method = linkage_method
         self.distance_metric = distance_metric
         
-        # SOINN 自组织精炼参数
         self.use_soinn_refinement = bool(use_soinn_refinement)
         self.soinn_ad = int(soinn_ad)
         self.soinn_lam = int(soinn_lam)
@@ -392,12 +326,10 @@ class HCSOINNClassifier:
         # None = disabled (evaluate all classes); int = number of NCM candidates.
         self.coarse_topk = None if coarse_topk is None else int(coarse_topk)
 
-        # 类中心（NCM）与样本计数
         self.class_mu: Dict[int, np.ndarray] = {}  # Normalized NCM centers for inference
         self.class_mu_raw: Dict[int, np.ndarray] = {}  # Raw (unnormalized) NCM centers for STAR
         self.class_count: Dict[int, int] = {}
 
-        # 类内子簇
         self.class_clusters: Dict[int, List[_Cluster]] = {}
         
         # STAR: Store ORIGINAL clusters and NCM centers (before any transformation)
@@ -414,7 +346,6 @@ class HCSOINNClassifier:
         # {cls: List[_Cluster]} - Stores deep copy of clusters
         self.frozen_clusters: Dict[int, List[_Cluster]] = {}
 
-        # 任务内缓存特征（仅在 compress 时聚类）
         self.buffers: Dict[int, List[np.ndarray]] = {}
 
         # ------------------------------------------------------------------ #
@@ -670,12 +601,9 @@ class HCSOINNClassifier:
             diff_raw = np.abs(centers_raw1 - centers_raw2)
     
     # ------------------------------------------------------------------ #
-    # 数据添加与压缩
     # ------------------------------------------------------------------ #
     def add_features(self, features: np.ndarray, labels: np.ndarray) -> None:
-        """
-        将当前任务的特征加入缓冲，并更新全局类中心（NCM）
-        """
+        """Handle add features."""
         features = np.asarray(features, dtype=np.float32)
         labels = np.asarray(labels, dtype=np.int64)
         if features.shape[0] == 0:
@@ -687,17 +615,14 @@ class HCSOINNClassifier:
             if cls_feats.shape[0] == 0:
                 continue
 
-            # 更新缓冲
             if cls not in self.buffers:
                 self.buffers[cls] = []
             self.buffers[cls].append(cls_feats)
 
-            # 更新完整特征的class_mu（标准模式）
             cls_count_old = self.class_count.get(cls, 0)
             if cls in self.class_mu_raw:
                 cls_sum_old = self.class_mu_raw[cls] * cls_count_old
             else:
-                # 如果类别不存在，初始化为与特征相同维度的零数组
                 cls_sum_old = np.zeros(cls_feats.shape[1], dtype=np.float32)
             cls_sum_new = cls_sum_old + cls_feats.sum(axis=0)
             cls_count_new = cls_count_old + cls_feats.shape[0]
@@ -716,23 +641,15 @@ class HCSOINNClassifier:
         self.invalidate_cache()
 
     def compress(self) -> None:
-        """
-        周期性压缩（通常在每个 task 结束时调用）：
-        - 对每个类将缓冲特征（可含旧簇中心）做层次聚类
-        - 使用多进程加速
-        """
+        """Handle compress."""
         tasks = []
         for cls, chunk_list in list(self.buffers.items()):
             if len(chunk_list) == 0:
                 continue
 
-            # 聚合缓冲特征
             feats = np.concatenate(chunk_list, axis=0).astype(np.float32, copy=False)
 
-            # 可选：将旧簇中心也纳入，避免完全遗忘已有结构
             if cls in self.class_clusters and len(self.class_clusters[cls]) > 0:
-                # FIX: 使用 center_raw (未归一化) 以保持特征尺度一致
-                # 如果混合了归一化(norm=1)和未归一化(norm~80)的特征，会导致聚类中心漂移
                 old_centers_raw = np.stack([c.center_raw for c in self.class_clusters[cls]], axis=0)
                 feats = np.concatenate([feats, old_centers_raw], axis=0)
 
@@ -747,11 +664,8 @@ class HCSOINNClassifier:
                 self.soinn_threshold_scale, self.soinn_max_iter, self.soinn_max_degree_for_removal
             ))
 
-        # 并行处理
         if tasks:
             logging.info(f"[HC-SOINN] Compressing {len(tasks)} classes using multiprocessing...")
-            # 使用 ProcessPoolExecutor 进行并行处理
-            # max_workers 默认是 CPU 核心数
             with ProcessPoolExecutor() as executor:
                 results = list(executor.map(_compress_class_worker, tasks))
             
@@ -778,16 +692,15 @@ class HCSOINNClassifier:
                     new_mean_norm = np.mean(np.linalg.norm(new_centers, axis=1))
                     new_mean_norm_raw = np.mean(np.linalg.norm(new_centers_raw, axis=1))
                     logging.info(
-                        f"[HC-SOINN DEBUG] Class {cls}: Created {len(clusters)} new nodes "
-                        f"(center_mean_norm={new_mean_norm:.6f}, center_raw_mean_norm={new_mean_norm_raw:.6f})"
+                        f"[HC-SOINN] Class {cls}: Created {len(clusters)} new nodes "
+                        # f"(center_mean_norm={new_mean_norm:.6f}, center_raw_mean_norm={new_mean_norm_raw:.6f})"
                     )
                 
                 if not hasattr(self, 'class_edges'):
                     self.class_edges: Dict[int, Dict[int, Set[int]]] = {}
-                self.class_edges[cls] = soinn_edges  # 存储边信息
-                self.buffers[cls] = []  # 清空缓冲
+                self.class_edges[cls] = soinn_edges
+                self.buffers[cls] = []
                 
-                # 记录层次聚类后的数量和最终数量，方便对比
                 if self.use_soinn_refinement:
                     logging.info(
                         f"[HC-SOINN] class {cls}: hierarchical_clusters={hierarchical_count} -> "
@@ -805,7 +718,6 @@ class HCSOINNClassifier:
         self.invalidate_cache()
 
     # ------------------------------------------------------------------ #
-    # 预测 (GPU 加速版)
     # ------------------------------------------------------------------ #
     def predict_topk(
         self, query_features, topk: int, total_classes: int, device=None,
@@ -815,22 +727,7 @@ class HCSOINNClassifier:
         init_cls: int = 10,
         ease_alpha: float = 0.5
     ) -> np.ndarray:
-        """
-        返回 shape [N, topk] 的类别索引
-        使用 GPU 矩阵运算加速
-        
-        Args:
-            query_features: [N, D] 查询特征 (torch.Tensor 或 np.ndarray，
-                            若为已在 device 上的 Tensor 则跳过 H2D 拷贝)
-            topk: 返回前K个
-            total_classes: 总类别数（用于fallback）
-            device: 计算设备
-            use_ease_reweighting: 是否使用 EASE 风格的分块加权距离
-            cur_task: 当前任务 ID (用于 EASE reweighting)
-            task_increment: 增量大小 (用于 EASE reweighting)
-            init_cls: 初始类别数 (用于 EASE reweighting)
-            ease_alpha: EASE 的 alpha 参数
-        """
+        """Handle predict topk."""
         if query_features.shape[0] == 0:
             return np.zeros((0, topk), dtype=np.int64)
             
@@ -844,13 +741,11 @@ class HCSOINNClassifier:
         query_features = np.asarray(query_features, dtype=np.float32)
         query_dim = query_features.shape[1]
         
-        # 标准模式：使用完整的特征
         classes = sorted(self.class_mu.keys())
         if len(classes) == 0:
             fallback = np.arange(min(topk, max(total_classes, 1)), dtype=np.int64)
             return np.tile(fallback, (query_t.shape[0], 1))
         
-        # 筛选有效类别
         valid_classes = [cls for cls in classes if self.class_mu[cls].shape[0] == query_dim]
         
         if not valid_classes:
@@ -874,16 +769,10 @@ class HCSOINNClassifier:
             self._profile_toc("normalize_query", stage_t0, device)
         
         # -----------------------------------------------------------
-        # 辅助函数：计算距离 (支持 EASE Reweighting 或 标准 Cosine)
         # -----------------------------------------------------------
         def compute_distance(protos_t, labels_t=None):
-            """
-            protos_t: [M, D] 原型向量
-            labels_t: [M] 对应的类别标签 (仅用于 EASE reweighting)
-            Return: [N, M] 距离矩阵
-            """
+            """Handle compute distance."""
             if use_ease_reweighting and cur_task > 0:
-                # EASE 风格：分块归一化 + 加权点积
                 chunk_dim = 768
                 num_chunks = query_dim // chunk_dim
                 
@@ -928,12 +817,10 @@ class HCSOINNClassifier:
                 return 1.0 - weighted_sim
                 
             else:
-                # 标准 Cosine Distance — reuse pre-normalized q_norm
                 sim = torch.mm(q_norm, protos_t.t())
                 return 1.0 - sim
 
         # -----------------------------------------------------------
-        # 1. 计算 NCM 距离
         # -----------------------------------------------------------
         ncm_centers_t = self._predict_cache["ncm_centers_t"]
         
@@ -943,7 +830,6 @@ class HCSOINNClassifier:
             self._profile_toc("compute_ncm_distance", stage_t0, device)
         
         # -----------------------------------------------------------
-        # 2. 计算 Sub-Cluster 距离 (with optional two-stage coarse filtering)
         # -----------------------------------------------------------
         all_protos_t = self._predict_cache["all_protos_t"]
         proto_labels_t = self._predict_cache["proto_labels_t"]
@@ -1010,17 +896,14 @@ class HCSOINNClassifier:
             if stage_t0 is not None:
                 self._profile_toc("compute_subcluster_distance", stage_t0, device)
         
-        # 融合分数
         # score = alpha * d_ncm + (1 - alpha) * d_sub
         stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
         final_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub
         
-        # 直接 TopK
         k = min(topk, len(valid_classes))
         _, indices = torch.topk(final_scores, k=k, dim=1, largest=False)
         indices = indices.cpu().numpy()
         
-        # 转换回原始类别ID
         valid_classes_t = np.array(valid_classes)
         top_preds = valid_classes_t[indices]  # [N, topk]
         if stage_t0 is not None:
@@ -1103,118 +986,22 @@ class HCSOINNClassifier:
         return full_logits
 
     # ------------------------------------------------------------------ #
-    # 特征漂移对齐支持
     # ------------------------------------------------------------------ #
     def get_class_prototypes_info(self, cls: int, k: int = 5) -> Tuple[np.ndarray, List[int]]:
-        """
-        ========================================================================
-        STAR 辅助函数：获取指定类别的 Top-K 原型节点信息
-        ========================================================================
-        
-        【功能】
-        返回指定类别中重要性最高的 Top-K 个 SOINN 节点中心，用于锚点选择。
-        
-        【重要性定义】
-        - 使用节点的 count 属性（样本计数）作为重要性指标
-        - count 越大，说明该节点代表的数据越多，是更重要的"骨架点"
-        
-        【用途】
-        在锚点选择时，我们选择 Top-K 节点对应的最近邻样本作为锚点。
-        这样可以保证锚点位于数据流形的"关节"位置，而不是边缘或低密度区域。
-        
-        【参数】
-        - cls: 类别 ID
-        - k: 返回的 Top-K 节点数量（默认 5）
-        
-        【返回】
-        - centers: [K, D] Top-K 节点中心（已归一化的单位向量）
-        - counts: [K] 每个节点的重要性（样本计数）
-        
-        【示例】
-        假设某类有 20 个节点，count 分别为 [100, 95, 80, 60, 50, ...]
-        返回 Top-5: centers=[前5个节点中心], counts=[100, 95, 80, 60, 50]
-        """
+        """Handle get class prototypes info."""
         if cls not in self.class_clusters or len(self.class_clusters[cls]) == 0:
             return np.zeros((0, 0)), []
             
         clusters = self.class_clusters[cls]
-        # 按 count 降序排列（重要性从高到低）
         sorted_clusters = sorted(clusters, key=lambda c: c.count, reverse=True)
-        top_clusters = sorted_clusters[:k]  # 取前 k 个
+        top_clusters = sorted_clusters[:k]
         
-        # 提取节点中心和计数
         centers = np.stack([c.center for c in top_clusters], axis=0)  # [K, D]
         counts = [c.count for c in top_clusters]  # [K]
         
         return centers, counts
 
-    def apply_rigid_transform(
-        self, 
-        cls: int, 
-        R: Optional[np.ndarray], 
-        mu_old: np.ndarray, 
-        mu_new: np.ndarray, 
-        scale: float = 1.0,  # 新增 scale 参数
-        base_scale: Optional[float] = None #以此为准，忽略此参数兼容性
-    ) -> None:
-        """
-        [Corrected for Chain Alignment]
-        Apply rigid transform (Rotation + Translation + Scaling) to current nodes.
-        Formula: W_new = s * (W_old - mu_old) @ R + mu_new
-        """
-        if cls not in self.class_clusters:
-            return
-            
-        clusters = self.class_clusters[cls]
-        if len(clusters) == 0:
-            return
-        
-        # 1. 获取当前节点 (Current Nodes)
-        # 移除 Plan B (Original Nodes)，因为我们执行的是 Chain Update
-        centers_raw = np.stack([c.center_raw for c in clusters], axis=0)  # [M, D]
-        
-        # 2. 应用变换 (Unnormalized Space)
-        # Step A: 去中心化 (相对于旧空间的锚点中心)
-        centers_centered = centers_raw - mu_old
-        
-        # Step B: 旋转
-        if R is not None:
-            centers_rotated = np.dot(centers_centered, R)
-        else:
-            centers_rotated = centers_centered
-            
-        # Step C: 缩放 & 平移 (相对于新空间的锚点中心)
-        centers_new_raw = (centers_rotated * scale) + mu_new
-        
-        # 3. 更新节点
-        for i, c in enumerate(clusters):
-            new_raw = centers_new_raw[i]
-            # 只有非零向量才更新
-            if np.linalg.norm(new_raw) > 1e-9:
-                c.center_raw = new_raw
-                c.center = _normalize(new_raw) # 重新归一化用于推理
-        
-        # 4. 同步更新 NCM 中心
-        if cls in self.class_mu_raw:
-            old_mu_raw = self.class_mu_raw[cls]
-            # 应用相同的变换逻辑
-            mu_centered = old_mu_raw - mu_old
-            if R is not None:
-                mu_rotated = np.dot(mu_centered, R)
-            else:
-                mu_rotated = mu_centered
-            
-            new_mu_raw = (mu_rotated * scale) + mu_new
-            
-            if np.linalg.norm(new_mu_raw) > 1e-9:
-                self.class_mu_raw[cls] = new_mu_raw
-                self.class_mu[cls] = _normalize(new_mu_raw)
-
-        # Nodes / class centers updated => invalidate inference cache
-        self.invalidate_cache()
-                
     # ------------------------------------------------------------------ #
-    # 工具函数
     # ------------------------------------------------------------------ #
     def prototypes_per_class(self) -> Dict[int, int]:
         return {c: len(v) for c, v in self.class_clusters.items() if len(v) > 0}

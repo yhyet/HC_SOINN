@@ -49,7 +49,6 @@
     "checkpoint_name": "coda_prompt_hc_soinn_star_cub",
     "load_all_checkpoints": false,
 
-    "star_mode": "trajectory",
     "star_lambda": 0.3,
 
     "analyze_cluster_structure_drift": false

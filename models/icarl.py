@@ -40,7 +40,7 @@ class Learner(BaseLearner):
         else:
             self.hc_soinn = None
 
-        # STAR Feature Alignment (Trajectory_STAR supported via star_mode='trajectory')
+        # STAR feature alignment (trajectory-only)
         self.use_feature_alignment = args.get("use_feature_alignment", False)
         self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
         self.star = None
@@ -60,13 +60,12 @@ class Learner(BaseLearner):
                 feature_extractor=feature_extractor,
                 device=self._device,
                 use_full_task_rehearsal=self.use_full_task_rehearsal,
-                star_mode=args.get("star_mode", "trajectory"),
                 star_lambda=args.get("star_lambda", 0.3),
             )
             if self.use_full_task_rehearsal:
                 logging.info("[iCaRL] STAR alignment initialized (FULL TASK REHEARSAL mode)")
             else:
-                logging.info(f"[iCaRL] STAR alignment initialized (mode={args.get('star_mode', 'trajectory')})")
+                logging.info("[iCaRL] STAR alignment initialized (trajectory)")
 
     def after_task(self):
         # STAR: select anchors for current task (for next task alignment)
@@ -261,16 +260,12 @@ class Learner(BaseLearner):
 
 
     def _build_hc_soinn_bank(self, data_manager):
-        """
-        构建HC-SOINN bank：类增量累积机制（只加入当前任务新类别数据）
-        旧类别由 STAR(可选) 在评估前对齐，避免每个任务重复用 exemplar 重建旧类原型。
-        """
+        """Handle build hc soinn bank."""
         if not self.use_hc_soinn:
             return
         
         logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
         
-        # 获取当前任务新类别的训练数据
         train_dataset = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
             source="train",
@@ -284,18 +279,14 @@ class Learner(BaseLearner):
             num_workers=num_workers
         )
         
-        # 提取特征
         vectors, targets_np = self._extract_vectors(train_loader)
-        # 归一化（与NCM保持一致）
         vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
         feats_np = vectors
         lbs_np = targets_np
         
         if len(feats_np) > 0:
-            # 添加到HC-SOINN
             self.hc_soinn.add_features(feats_np, lbs_np)
             
-            # 压缩（生成原型节点）
             try:
                 self.hc_soinn.compress()
                 logging.info("HC-SOINN bank built successfully")
@@ -303,21 +294,16 @@ class Learner(BaseLearner):
                 logging.error(f"HC-SOINN compress error: {e}", exc_info=True)
     
     def _eval_hc_soinn(self, loader):
-        """
-        使用HC-SOINN分类器进行评估
-        """
+        """Handle eval hc soinn."""
         if not self.use_hc_soinn or self.hc_soinn is None:
             return None, None
         
         self._network.eval()
         y_pred, y_true = [], []
         
-        # 提取所有特征
         vectors, targets_np = self._extract_vectors(loader)
-        # 归一化
         vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
         
-        # 使用HC-SOINN预测
         topk_pred = self.hc_soinn.predict_topk(
             vectors, k=1, return_distances=False
         )
@@ -332,7 +318,7 @@ class Learner(BaseLearner):
             return None, None
     
     def eval_task(self):
-        """评估任务：使用FC、NCM和HC-SOINN分类器"""
+        """Handle eval task."""
         # STAR: pre-evaluation alignment (align old classes before evaluation)
         if self.star is not None and self._cur_task > 0 and getattr(self, "use_hc_soinn", False) and self.hc_soinn is not None:
             try:
@@ -354,7 +340,6 @@ class Learner(BaseLearner):
         else:
             nme_accy = None
 
-        # 添加HC-SOINN评估
         results = {"fc": cnn_accy}
         if nme_accy is not None:
             results["ncm"] = nme_accy

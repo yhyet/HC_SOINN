@@ -48,11 +48,9 @@
 
     "use_feature_alignment": false,
     "use_full_task_rehearsal": false,
-    "star_mode": "trajectory",
     "star_lambda": 1,
 
     "analyze_cluster_structure_drift": false,
-    "enable_storage_analysis": false,
     "use_ncm": false,
     "visualize_tsne": false,
     "eval_fc": false

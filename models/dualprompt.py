@@ -22,7 +22,6 @@ class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         
-        # KAC分类器支持
         self.use_kac = args.get("use_kac", False)
         if self.use_kac:
             logging.info("KAC classifier enabled for DualPrompt")
@@ -96,19 +95,14 @@ class Learner(BaseLearner):
                 feature_extractor=feature_extractor,
                 device=self._device,
                 use_full_task_rehearsal=self.use_full_task_rehearsal,
-                star_mode=args.get("star_mode", "rigid"),
                 star_lambda=args.get("star_lambda", 0.3),
             )
 
-        # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
         self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
-        self.cluster_analyzer = None  # 簇结构分析器（延迟初始化）
+        self.cluster_analyzer = None
         
         if self.analyze_cluster_structure_drift:
-            logging.info("簇结构分析实验启用：将计算Procrustes距离验证特征漂移时簇结构是否改变")
-            # 定义特征提取函数（适配 DualPrompt 的网络结构）
             def feature_extractor(x):
-                # 对于 cluster_structure_analyzer，通常我们想要提取当前任务视角下的特征
                 return self._network.extract_vector(x, task_id=self._cur_task)
             
             self.cluster_analyzer = ClusterStructureAnalyzer(
@@ -117,12 +111,8 @@ class Learner(BaseLearner):
                 args=args
             )
 
-        # NCM分类器支持
         self.use_ncm = args.get("use_ncm", False)
-        # NCM分类器：初始化类均值存储
         self._class_means = None
-        # feature_dim 是 BaseLearner 的 @property，会从 self._network.feature_dim 获取
-        # 不需要在这里设置，PromptVitNet 中已经有 feature_dim 属性
 
         # Freeze the parameters for ViT.
         if self.args["freeze"]:
@@ -139,7 +129,6 @@ class Learner(BaseLearner):
         total_trainable_params = sum(p.numel() for p in self._network.backbone.parameters() if p.requires_grad)
         logging.info(f'{total_trainable_params:,} model training parameters.')
         
-        # KAC分类器参数统计
         if self.use_kac and hasattr(self._network.backbone, 'head'):
             head_params = sum(p.numel() for p in self._network.backbone.head.parameters() if p.requires_grad)
             logging.info(f'  - Head (KAC) parameters: {head_params:,}')
@@ -151,9 +140,7 @@ class Learner(BaseLearner):
                     logging.info("{}: {}".format(name, param.numel()))
 
     def after_task(self):
-        # STAR: 为当前任务选择锚点（用于下一轮漂移对齐）
         if self.star is not None:
-            # 获取当前任务的训练数据集
             dataset = self.data_manager.get_dataset(
                 np.arange(self._known_classes, self._total_classes),
                 source="train", mode="test"
@@ -166,11 +153,9 @@ class Learner(BaseLearner):
                 current_task_classes=current_task_classes
             )
             
-        # 簇结构分析实验：保存Task 1样本或计算Procrustes距离
         if self.cluster_analyzer is not None:
             if self._cur_task == 0:
-                # Task 1结束后：保存所有训练样本
-                init_cls = self._total_classes # DualPrompt 初始化类数可能不叫 init_cls，直接用 _total_classes
+                init_cls = self._total_classes
                 dataset_loader = lambda: self.data_manager.get_dataset(
                     np.arange(0, init_cls), source="train", mode="test"
                 )
@@ -180,7 +165,6 @@ class Learner(BaseLearner):
                     num_workers=num_workers
                 )
             else:
-                # 后续任务：计算Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
 
         self._known_classes = self._total_classes
@@ -211,7 +195,6 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         
-        # 训练结束后，统一构建所有分类器（NCM、HC-SOINN等）
         self._build_classifiers()
 
     def _train(self, train_loader, test_loader):
@@ -229,10 +212,8 @@ class Learner(BaseLearner):
         self._init_train(train_loader, test_loader, optimizer, scheduler)
 
     def get_optimizer(self):
-        # 获取所有可训练参数（包括KAC分类器参数）
         trainable_params = filter(lambda p: p.requires_grad, self._network.parameters())
         
-        # 验证KAC分类器的参数是否被正确包含
         if self.use_kac and hasattr(self._network.backbone, 'head'):
             head_param_count = sum(p.numel() for p in self._network.backbone.head.parameters() if p.requires_grad)
             logging.info(f"KAC classifier parameters included in optimizer: {head_param_count:,}")
@@ -368,7 +349,7 @@ class Learner(BaseLearner):
         logging.info(info)
 
     def _eval_cnn(self, loader):
-        """使用backbone分类器进行评估（支持KAC分类器）"""
+        """Handle eval cnn."""
         self._network.eval()
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):
@@ -386,22 +367,16 @@ class Learner(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
     
     def _eval_kac(self, loader):
-        """使用KAC分类器进行评估（与_eval_cnn相同，但用于区分）"""
-        # KAC分类器已经集成在backbone.head中，所以可以直接使用_eval_cnn
+        """Handle eval kac."""
         return self._eval_cnn(loader)
 
     def _build_classifiers(self):
-        """
-        统一构建所有分类器（在训练结束后、测试开始前调用）
-        包括：NCM分类器、HC-SOINN bank
-        """
+        """Handle build classifiers."""
         logging.info(f"Building classifiers for task {self._cur_task} (total classes: {self._total_classes})")
         
-        # 确保模型在正确的设备上并处于eval模式
         self._network.to(self._device)
         self._network.eval()
         
-        # ========== Step 0: STAR 特征漂移对齐 (在评估前对齐旧类别) ==========
         if self.star is not None and self._cur_task > 0:
             current_task_classes = set(range(self._known_classes, self._total_classes))
             self.star.align_old_classes(
@@ -409,20 +384,16 @@ class Learner(BaseLearner):
                 current_task_classes=current_task_classes
             )
         
-        # 1. 构建NCM分类器
         if getattr(self, "use_ncm", False):
             self._build_ncm_classifier()
         
-        # 2. 构建 HC-SOINN bank
         if getattr(self, "use_hc_soinn", False):
             self._build_hc_soinn_bank()
         
         logging.info("All classifiers built successfully")
 
     def _build_ncm_classifier(self):
-        """
-        构建NCM分类器：累积存储机制
-        """
+        """Handle build ncm classifier."""
         ncm_classes = self._total_classes
         need_rebuild_all = (self._class_means is None) or (self._class_means.shape[0] == 0)
         
@@ -444,7 +415,6 @@ class Learner(BaseLearner):
             with torch.no_grad():
                 for _, (_, inputs, targets) in enumerate(all_train_loader):
                     inputs = inputs.to(self._device)
-                    # 传入 task_id，确保特征提取一致性
                     embeddings = self._network.extract_vector(inputs, task_id=self._cur_task)
                     embedding_list.append(embeddings.cpu())
                     label_list.append(targets.cpu())
@@ -473,7 +443,6 @@ class Learner(BaseLearner):
             with torch.no_grad():
                 for _, (_, inputs, targets) in enumerate(current_task_loader):
                     inputs = inputs.to(self._device)
-                    # 传入 task_id
                     embeddings = self._network.extract_vector(inputs, task_id=self._cur_task)
                     embedding_list.append(embeddings.cpu())
                     label_list.append(targets.cpu())
@@ -485,14 +454,12 @@ class Learner(BaseLearner):
                     data_index = (label_list == class_index).nonzero().squeeze(-1)
                     self._class_means[int(class_index), :] = embedding_list[data_index].mean(0).numpy()
 
-        # 更新NCM FC层权重
         for class_index in range(ncm_classes):
             if np.any(self._class_means[class_index] != 0):
                 self._network.ncm_fc.weight.data[int(class_index), :] = torch.from_numpy(self._class_means[int(class_index), :]).float().to(self._device)
 
     def _get_soinn_feature_fn(self):
         def feature_fn(x):
-            # 传入 task_id
             feats = self._network.extract_vector(x, task_id=self._cur_task)
             return feats
         return feature_fn
@@ -530,7 +497,6 @@ class Learner(BaseLearner):
         with torch.no_grad():
             for _, (_, inputs, targets) in enumerate(loader):
                 inputs = inputs.to(self._device)
-                # 传入 task_id
                 features = self._network.extract_vector(inputs, task_id=self._cur_task)
                 ncm_output = self._network.ncm_fc(features)
                 ncm_logits = ncm_output['logits'][:, :self._total_classes]
@@ -551,7 +517,6 @@ class Learner(BaseLearner):
                 inputs = inputs.to(self._device)
                 feats = feature_fn(inputs)
                 
-                # 手动做一次L2归一化
                 feats = F.normalize(feats, p=2, dim=1)
                 feats_np = feats.cpu().numpy()
 
@@ -590,13 +555,9 @@ class Learner(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def eval_task(self):
-        """
-        评估任务：评估多种分类器
-        返回分类器的精度结果
-        """
+        """Handle eval task."""
         results = {}
         
-        # 1. 使用backbone分类器评估
         if self.use_kac:
             y_pred_kac, y_true_kac = self._eval_kac(self.test_loader)
             results["kac"] = self._evaluate(y_pred_kac, y_true_kac)
@@ -605,7 +566,6 @@ class Learner(BaseLearner):
             y_pred_fc, y_true_fc = self._eval_cnn(self.test_loader)
             results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
         
-        # 2. 使用 HC-SOINN 分类器评估
         if getattr(self, "use_hc_soinn", False):
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
@@ -613,7 +573,6 @@ class Learner(BaseLearner):
                 y_pred_mix, y_true_mix = self._eval_hc_soinn_fc_fusion(self.test_loader)
                 results["hc_soinn_fc_fusion"] = self._evaluate(y_pred_mix, y_true_mix)
         
-        # 3. 使用 NCM 分类器评估
         if getattr(self, "use_ncm", False) and self._class_means is not None:
             y_pred_ncm, y_true_ncm = self._eval_ncm_fc(self.test_loader)
             results["ncm"] = self._evaluate(y_pred_ncm, y_true_ncm)

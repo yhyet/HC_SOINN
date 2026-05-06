@@ -159,7 +159,6 @@ def get_backbone(args, pretrained=False):
     elif '_dualprompt' in name:
         if args["model_name"] == "dualprompt":
             from backbone import vit_dualprompt
-            # KAC分类器支持
             use_kac = args.get("use_kac", False)
             kac_config = args.get("kac_config", {})
             
@@ -699,17 +698,15 @@ class SEMAVitNet(BaseNet):
         super().__init__(args, pretrained)
         self.fc = None
         self.args = args
-        # NCM分类器：用于存储类均值的FC层（使用CosineLinear，自动归一化）
         self.ncm_fc = CosineLinear(768, args["nb_classes"], sigma=False)
 
     @property
     def feature_dim(self):
-        """重写feature_dim property，返回固定的768维度"""
+        """Handle feature dim."""
         return 768
 
     def extract_vector(self, x):
         out = self.backbone(x)
-        # SEMA 的 backbone 返回字典，需要提取 "features"
         if isinstance(out, dict):
             return out["features"]
         return out
@@ -724,14 +721,11 @@ class SEMAVitNet(BaseNet):
 class SimpleVitNetKNN(BaseNet):
     def __init__(self, args, pretrained):
         super().__init__(args, pretrained)
-        # 不需要分类器，因为使用KNN进行分类
 
     def update_fc(self, nb_classes, nextperiod_initialization=None):
-        # KNN方法不需要更新分类器
         pass
 
     def generate_fc(self, in_dim, out_dim):
-        # KNN方法不需要生成分类器
         return None
 
     def extract_vector(self, x):
@@ -739,7 +733,6 @@ class SimpleVitNetKNN(BaseNet):
 
     def forward(self, x):
         x = self.backbone(x)
-        # 不进行分类，直接返回特征
         out = {"features": x}
         return out
 
@@ -758,7 +751,6 @@ class PromptVitNet(nn.Module):
         else:
             self.original_backbone = None
         
-        # NCM分类器：用于存储类均值的FC层
         self.ncm_fc = CosineLinear(768, args["nb_classes"], sigma=False)
         self.feature_dim = 768
             
@@ -783,7 +775,7 @@ class PromptVitNet(nn.Module):
         return x
 
     def extract_vector(self, x, task_id=-1):
-        """提取特征向量，用于NCM、KNN、HC-SOINN分类器"""
+        """Handle extract vector."""
         with torch.no_grad():
             if self.original_backbone is not None:
                 cls_features = self.original_backbone(x)['pre_logits']
@@ -791,7 +783,6 @@ class PromptVitNet(nn.Module):
                 cls_features = None
         
         res = self.backbone(x, task_id=task_id, cls_features=cls_features, train=False)
-        # 从字典结果中提取特征
         if isinstance(res, dict):
             if 'features' in res:
                 return res['features']
@@ -805,12 +796,10 @@ class CodaPromptVitNet(nn.Module):
         self.args = args
         self.backbone = get_backbone(args, pretrained)
         
-        # KAC分类器支持
         self.use_kac = args.get("use_kac", False)
         kac_config = args.get("kac_config", {})
         
         if self.use_kac:
-            # 使用KAC分类器
             logging.info("Using KAC classifier instead of linear classifier")
             self.fc = KACLayer(
                 input_dim=768,
@@ -821,13 +810,10 @@ class CodaPromptVitNet(nn.Module):
                 spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
             )
         else:
-            # 使用标准线性分类器
             self.fc = nn.Linear(768, args["nb_classes"])
         
         self.prompt = CodaPrompt(768, args["nb_tasks"], args["prompt_param"])
-        # NCM分类器：用于存储类均值的FC层（使用CosineLinear，自动归一化）
         self.ncm_fc = CosineLinear(768, args["nb_classes"], sigma=False)
-        # 添加feature_dim属性，用于BaseLearner的@property
         self.feature_dim = 768
 
     # pen: get penultimate features  
@@ -850,7 +836,7 @@ class CodaPromptVitNet(nn.Module):
             return out
     
     def extract_vector(self, x):
-        """提取特征向量，用于NCM分类器"""
+        """Handle extract vector."""
         if self.prompt is not None:
             with torch.no_grad():
                 q, _ = self.backbone(x)
@@ -864,18 +850,11 @@ class CodaPromptVitNet(nn.Module):
         return out
     
     def update_fc(self, nb_classes):
-        """
-        增量学习场景下的类别扩展
-        
-        Args:
-            nb_classes: 新的类别总数
-        """
+        """Handle update fc."""
         if self.use_kac:
-            # KAC分类器：使用update方法扩展输出维度
             if hasattr(self.fc, 'update'):
                 self.fc.update(nb_classes)
             else:
-                # 如果KACLayer没有update方法，重新创建
                 kac_config = self.args.get("kac_config", {})
                 old_fc = self.fc
                 self.fc = KACLayer(
@@ -886,13 +865,11 @@ class CodaPromptVitNet(nn.Module):
                     num_grids=kac_config.get("num_grids", 16),
                     spline_weight_init_scale=kac_config.get("spline_weight_init_scale", 0.1),
                 )
-                # 尝试复制旧权重（如果维度兼容）
                 if hasattr(old_fc, 'spline_linear') and hasattr(self.fc, 'spline_linear'):
                     old_out_dim = old_fc.output_dim
                     if old_out_dim <= nb_classes:
                         self.fc.spline_linear.weight.data[:old_out_dim, :] = old_fc.spline_linear.weight.data
         else:
-            # 标准线性分类器：保存旧权重并扩展
             if self.fc is not None:
                 nb_output = self.fc.out_features
                 weight = copy.deepcopy(self.fc.weight.data)
@@ -909,13 +886,7 @@ class CodaPromptVitNet(nn.Module):
             self.fc = fc
     
     def generate_fc(self, in_dim, out_dim):
-        """
-        生成分类器层
-        
-        Args:
-            in_dim: 输入维度
-            out_dim: 输出维度
-        """
+        """Handle generate fc."""
         if self.use_kac:
             kac_config = self.args.get("kac_config", {})
             return KACLayer(
@@ -943,7 +914,7 @@ class MultiBranchCosineIncrementalNet(BaseNet):
 
         self.backbones = nn.ModuleList()
         self.args=args
-        self._feature_dim = None  # 将在construct_dual_branch_network中设置
+        self._feature_dim = None
         
         if 'resnet' in args['backbone_type']:
             self.model_type='cnn'
@@ -952,13 +923,11 @@ class MultiBranchCosineIncrementalNet(BaseNet):
 
     @property
     def feature_dim(self):
-        """返回特征维度，用于BaseLearner"""
+        """Handle feature dim."""
         if self._feature_dim is not None:
             return self._feature_dim
-        # 如果还没有构建dual branch，返回默认值
         if len(self.backbones) > 0:
             return self.backbones[0].out_dim * len(self.backbones)
-        # 如果没有backbones，返回基类的feature_dim（虽然backbone是Identity，但这是fallback）
         return super().feature_dim
 
     def update_fc(self, nb_classes, nextperiod_initialization=None):
@@ -993,7 +962,7 @@ class MultiBranchCosineIncrementalNet(BaseNet):
         return out
 
     def extract_vector(self, x):
-        """提取特征向量，用于HC-SOINN等分类器"""
+        """Handle extract vector."""
         if self.model_type == 'cnn':
             features = [backbone(x)["features"] for backbone in self.backbones]
         else:

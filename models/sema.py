@@ -30,19 +30,15 @@ class Learner(BaseLearner):
         self.min_lr = args['min_lr'] if args['min_lr'] is not None else 1e-8
         self.args = args
         
-        # 簇结构分析实验：验证特征漂移时簇内部结构是否改变
         self.analyze_cluster_structure_drift = args.get("analyze_cluster_structure_drift", False)
-        self.cluster_analyzer = None  # 簇结构分析器（延迟初始化）
+        self.cluster_analyzer = None
         
         if self.analyze_cluster_structure_drift:
-            logging.info("簇结构分析实验启用：将计算Procrustes距离验证特征漂移时簇结构是否改变")
-            # 定义特征提取函数（适配 SEMA 的网络结构）
             def feature_extractor(x):
                 if isinstance(self._network, nn.DataParallel):
                     feats = self._network.module.extract_vector(x)
                 else:
                     feats = self._network.extract_vector(x)
-                # SEMA 的 extract_vector 返回字典，需要提取 "features"
                 if isinstance(feats, dict):
                     feats = feats["features"]
                 return feats
@@ -53,9 +49,7 @@ class Learner(BaseLearner):
                 args=args
             )
         
-        # NCM分类器：初始化类均值存储（默认开启）
         self._class_means = None
-        # feature_dim 是 BaseLearner 的 @property，会从 self._network.feature_dim 获取
         
         # HC-SOINN plugin
         self.use_hc_soinn = args.get("use_hc_soinn", False)
@@ -76,13 +70,11 @@ class Learner(BaseLearner):
                 soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
             )
 
-        # STAR 特征漂移对齐配置（支持 rigid / trajectory）
         self.use_feature_alignment = args.get("use_feature_alignment", False)
         self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
-        self.star = None  # STARAligner（延迟初始化）
+        self.star = None
 
         if self.use_feature_alignment and self.use_hc_soinn:
-            # 适配 SEMA：extract_vector 可能返回 dict，需要提取 "features"
             def feature_extractor(x, class_id=None):
                 if isinstance(self._network, nn.DataParallel):
                     feats = self._network.module.extract_vector(x)
@@ -97,7 +89,6 @@ class Learner(BaseLearner):
                 feature_extractor=feature_extractor,
                 device=self._device,
                 use_full_task_rehearsal=self.use_full_task_rehearsal,
-                star_mode=args.get("star_mode", "rigid"),
                 star_lambda=args.get("star_lambda", 0.3),
             )
             if self.use_full_task_rehearsal:
@@ -107,14 +98,9 @@ class Learner(BaseLearner):
         
 
     def after_task(self):
-        """
-        每个 task 结束后的处理流程
-        """
-        # 簇结构分析实验：保存Task 0样本或计算Procrustes距离
+        """Handle after task."""
         if self.cluster_analyzer is not None:
             if self._cur_task == 0:
-                # Task 0结束后：保存第一个任务（Task 0）的所有训练样本
-                # 这些样本将作为基准，用于后续任务计算Procrustes距离
                 init_cls = self.args.get("init_cls", 10)
                 dataset_loader = lambda: self.data_manager.get_dataset(
                     np.arange(0, init_cls), source="train", mode="test"
@@ -125,11 +111,8 @@ class Learner(BaseLearner):
                     num_workers=num_workers
                 )
             else:
-                # 后续任务（Task 1, 2, ...）：计算与Task 0的Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
 
-        # STAR：为当前任务选择锚点（用于下一轮 Task 的漂移对齐）
-        # 注意：HC-SOINN compress 已前移到 _build_classifiers()（评估前），这里不再重复 compress。
         if self.star is not None:
             current_task_classes = set(range(self._known_classes, self._total_classes))
             dataset = self.data_manager.get_dataset(
@@ -174,7 +157,6 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         
-        # 训练结束后，构建所有分类器
         self._build_classifiers()
 
     def _train(self, train_loader, test_loader):
@@ -214,7 +196,6 @@ class Learner(BaseLearner):
         self._init_train(self.args['rd_epoch'], train_loader, test_loader, self.rd_optimizer, self.rd_scheduler, phase='rd')
 
     def _detect_outlier(self, detect_loader, train_loader, test_loader, added):
-        #检测并训练新组件
         is_added = False
         for i, (_, inputs, targets) in enumerate(detect_loader):
             inputs, targets = inputs.to(self._device), targets.to(self._device)
@@ -334,16 +315,13 @@ class Learner(BaseLearner):
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
     
     def _get_soinn_feature_fn(self):
-        """
-        获取SOINN特征提取函数（统一特征提取逻辑）
-        """
+        """Handle feature fn."""
         def feature_fn(x):
             if isinstance(self._network, nn.DataParallel):
                 feats = self._network.module.extract_vector(x)
             else:
                 feats = self._network.extract_vector(x)
             
-            # SEMA 的 extract_vector 返回字典，需要提取 "features"
             if isinstance(feats, dict):
                 feats = feats["features"]
             
@@ -360,11 +338,7 @@ class Learner(BaseLearner):
         return feature_fn
     
     def _build_hc_soinn_bank(self):
-        """
-        构建 HC-SOINN bank：类增量学习场景下的累积存储
-        - 每个任务只使用当前任务的新类别训练数据（符合类增量学习设定）
-        - 旧类别的信息通过已保存的簇中心保留（在 compress 时合并）
-        """
+        """Handle build hc soinn bank."""
         hc_bank_empty = (not hasattr(self, "hc_soinn")) or (len(getattr(self.hc_soinn, "class_clusters", {})) == 0)
         if hc_bank_empty:
             logging.info(f"HC-SOINN bank is empty!!!")
@@ -386,7 +360,6 @@ class Learner(BaseLearner):
             lbs_np = np.concatenate(lbs, axis=0)
             self.hc_soinn.add_features(feats_np, lbs_np)
 
-        # 类增量学习：每个任务只使用当前任务的新类别训练数据
         logging.info(f"Building HC-SOINN bank: adding new classes ({self._known_classes}-{self._total_classes-1})")
         current_task_dataset = self.data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes), source="train", mode="test"
@@ -400,10 +373,9 @@ class Learner(BaseLearner):
         )
         add_from_loader(current_task_loader)
         
-        # 注意：compress() 已前移到 _build_classifiers()（评估前），这里仅添加当前任务特征到 buffers
     
     def _eval_hc_soinn(self, loader):
-        """使用 HC-SOINN 分类器进行评估"""
+        """Handle eval hc soinn."""
         self._network.eval()
         y_pred, y_true = [], []
         feature_fn = self._get_soinn_feature_fn()
@@ -430,36 +402,25 @@ class Learner(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)
     
     def _build_classifiers(self):
-        """
-        统一构建所有分类器（在训练结束后、测试开始前调用）
-        包括：NCM分类器、HC-SOINN bank（如果启用）
-        """
+        """Handle build classifiers."""
         logging.info(f"Building classifiers for task {self._cur_task} (total classes: {self._total_classes})")
         
-        # 确保模型在正确的设备上并处于eval模式
         self._network.to(self._device)
         self._network.eval()
 
-        # 当前任务的新类别集合（用于 STAR：跳过对齐新类）
         current_task_classes = set(range(self._known_classes, self._total_classes))
 
-        # ========== Step 0: STAR 漂移对齐（评估前对齐旧类别）==========
-        # 重要：trainer.py 的调用顺序是 incremental_train -> eval_task -> after_task
-        # 因此对齐必须发生在 eval_task 之前，否则评估用到的还是未对齐的旧原型。
         if self.star is not None and self._cur_task > 0:
             self.star.align_old_classes(
                 cur_task=self._cur_task,
                 current_task_classes=current_task_classes,
             )
         
-        # 1. 构建NCM分类器：计算所有已见过的任务的类均值
         self._build_ncm_classifier()
         
-        # 2. 构建 HC-SOINN bank（如果启用）：添加当前任务新类特征到 buffers
         if getattr(self, "use_hc_soinn", False):
             self._build_hc_soinn_bank()
 
-            # 评估前压缩：生成当前任务新类的 clusters（使 HC-SOINN 评估不再退化为 NCM）
             try:
                 self.hc_soinn.compress()
             except Exception as e:
@@ -468,19 +429,12 @@ class Learner(BaseLearner):
         logging.info("All classifiers built successfully")
     
     def _build_ncm_classifier(self):
-        """
-        构建NCM分类器：累积存储机制
-        - 如果之前有类均值（正常训练）：保留之前任务的类均值，只计算当前任务新类别的类均值
-        - 如果没有类均值（首次任务或加载checkpoint后）：计算所有已见过的任务的类均值
-        - 这样符合增量学习的累积存储要求
-        """
+        """Handle build ncm classifier."""
         ncm_classes = self._total_classes
         
-        # 判断是否需要重建所有类均值（首次任务或加载checkpoint后）
         need_rebuild_all = (self._class_means is None) or (self._class_means.shape[0] == 0)
         
         if need_rebuild_all:
-            # 首次任务或加载checkpoint后：需要计算所有已见过的任务的类均值
             logging.info(f"Building NCM classifier: computing all seen classes (0-{ncm_classes-1}) [first task or after checkpoint load]")
             all_train_dataset = self.data_manager.get_dataset(
                 np.arange(0, ncm_classes), source="train", mode="test"
@@ -493,10 +447,8 @@ class Learner(BaseLearner):
                 num_workers=num_workers
             )
             
-            # 初始化类均值数组
             self._class_means = np.zeros((ncm_classes, self.feature_dim))
             
-            # 提取所有训练样本的特征
             embedding_list = []
             label_list = []
             
@@ -514,7 +466,6 @@ class Learner(BaseLearner):
                 embedding_list = torch.cat(embedding_list, dim=0)
                 label_list = torch.cat(label_list, dim=0)
                 
-                # 计算所有已见过的类别的均值
                 class_list = np.unique(label_list.numpy())
                 for class_index in class_list:
                     data_index = (label_list == class_index).nonzero().squeeze(-1)
@@ -526,17 +477,14 @@ class Learner(BaseLearner):
             else:
                 logging.warning("No training data available for NCM classifier")
         else:
-            # 正常训练：累积存储机制 - 保留之前的类均值，只计算当前任务新类别的类均值
             logging.info(f"Building NCM classifier: preserving previous class means, computing new classes ({self._known_classes}-{self._total_classes-1})")
             
-            # 扩展类均值数组以容纳新类别，保留之前的类均值
             if self._class_means.shape[0] < self._total_classes:
                 new_class_means = np.zeros((self._total_classes, self.feature_dim))
                 new_class_means[:self._class_means.shape[0]] = self._class_means
                 self._class_means = new_class_means
                 logging.info(f"Extended NCM classifier: preserved {self._class_means.shape[0] - (self._total_classes - self._known_classes)} previous class means")
             
-            # 只获取当前任务的训练数据（累积存储：过往数据已存储，只需添加当前任务）
             current_task_dataset = self.data_manager.get_dataset(
                 np.arange(self._known_classes, self._total_classes), source="train", mode="test"
             )
@@ -548,7 +496,6 @@ class Learner(BaseLearner):
                 num_workers=num_workers
             )
             
-            # 提取当前任务训练样本的特征
             embedding_list = []
             label_list = []
             
@@ -566,7 +513,6 @@ class Learner(BaseLearner):
                 embedding_list = torch.cat(embedding_list, dim=0)
                 label_list = torch.cat(label_list, dim=0)
                 
-                # 只计算当前任务新类别的均值（累积存储：过往类均值已保留）
                 class_list = np.unique(label_list.numpy())
                 for class_index in class_list:
                     data_index = (label_list == class_index).nonzero().squeeze(-1)
@@ -578,18 +524,17 @@ class Learner(BaseLearner):
             else:
                 logging.warning("No training data available for NCM classifier update")
         
-        # 更新所有类别的NCM FC层权重
         if isinstance(self._network, nn.DataParallel):
             for class_index in range(ncm_classes):
-                if np.any(self._class_means[class_index] != 0):  # 只更新有数据的类别
+                if np.any(self._class_means[class_index] != 0):
                     self._network.module.ncm_fc.weight.data[int(class_index), :] = torch.from_numpy(self._class_means[int(class_index), :]).float().to(self._device)
         else:
             for class_index in range(ncm_classes):
-                if np.any(self._class_means[class_index] != 0):  # 只更新有数据的类别
+                if np.any(self._class_means[class_index] != 0):
                     self._network.ncm_fc.weight.data[int(class_index), :] = torch.from_numpy(self._class_means[int(class_index), :]).float().to(self._device)
     
     def _eval_ncm_fc(self, loader):
-        """使用NCM FC层进行评估（CosineLinear会自动归一化）"""
+        """Handle eval ncm fc."""
         self._network.eval()
         y_pred, y_true = [], []
         ncm_classes = self._total_classes
@@ -597,20 +542,14 @@ class Learner(BaseLearner):
         with torch.no_grad():
             for _, (_, inputs, targets) in enumerate(loader):
                 inputs = inputs.to(self._device)
-                # 提取特征（不需要归一化，CosineLinear会自动归一化）
                 if isinstance(self._network, nn.DataParallel):
                     features = self._network.module.extract_vector(inputs)
-                    # CosineLinear返回字典格式 {'logits': ...}
                     ncm_output = self._network.module.ncm_fc(features)
                 else:
                     features = self._network.extract_vector(inputs)
-                    # CosineLinear返回字典格式 {'logits': ...}
                     ncm_output = self._network.ncm_fc(features)
-                # 提取logits
                 ncm_logits = ncm_output['logits']
-                # 只保留已学习类别
                 ncm_logits = ncm_logits[:, :ncm_classes]
-                # Top-k预测
                 predicts = torch.topk(
                     ncm_logits, k=self.topk, dim=1, largest=True, sorted=True
                 )[1]
@@ -655,21 +594,17 @@ class Learner(BaseLearner):
     def eval_task(self):
         results = {}
         
-        # 1. 使用原始FC分类器评估
         y_pred_fc, y_true_fc = self._eval_cnn(self.test_loader)
         results["fc"] = self._evaluate(y_pred_fc, y_true_fc)
         
-        # 2. 使用NCM分类器评估（默认开启）
         if hasattr(self, "_class_means") and self._class_means is not None:
             y_pred_ncm, y_true_ncm = self._eval_ncm_fc(self.test_loader)
             results["ncm"] = self._evaluate(y_pred_ncm, y_true_ncm)
         
-        # 3. 使用 HC-SOINN 分类器评估（如果启用）
         if getattr(self, "use_hc_soinn", False):
             y_pred_hc, y_true_hc = self._eval_hc_soinn(self.test_loader)
             results["hc_soinn"] = self._evaluate(y_pred_hc, y_true_hc)
         
-        # 为了向后兼容，如果只有fc结果，返回元组格式
         if len(results) == 1 and "fc" in results:
             ncm_accy = results.get("ncm", None)
             return results["fc"], ncm_accy

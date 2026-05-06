@@ -49,7 +49,6 @@
     
     "analyze_cluster_structure_drift": false,
     "use_feature_alignment": true,
-    "star_mode": "trajectory",
     "star_lambda": 1,
     "procrustes_debug_use_testset": true,
     "procrustes_debug_force_eval": true,

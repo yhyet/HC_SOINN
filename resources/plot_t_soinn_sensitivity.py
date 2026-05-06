@@ -1,7 +1,4 @@
-"""
-HC-SOINN SOINN 精炼迭代次数 T_soinn（hcsoinn_soinn_max_iter）敏感性：
-三个独立子图分别绘制 A_Avg、A_Last、每类平均原型数。
-"""
+"""Core component."""
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import numpy as np
