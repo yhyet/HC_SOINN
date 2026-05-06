@@ -36,12 +36,8 @@
     "hcsoinn_soinn_max_iter": 1,
     "hcsoinn_soinn_max_degree_for_removal": 0,
 
-    "use_feature_alignment": false,
-    "use_full_task_rehearsal": false,
     "test_only_first_task_classes": false,
 
-    "analyze_cluster_structure_drift": false,
-    "star_mode": "trajectory",
-    "star_lambda": 0.3
+    "analyze_cluster_structure_drift": false
 }
 

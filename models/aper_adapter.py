@@ -12,7 +12,6 @@ from models.base import BaseLearner
 from utils.toolkit import target2onehot, tensor2numpy
 from utils.hc_soinn_classifier import HCSOINNClassifier
 from utils.cluster_structure_analyzer import ClusterStructureAnalyzer
-from utils.STAR import STARAligner
 
 # tune the model at first session with adapter, and then conduct simplecil.
 num_workers = 8
@@ -74,67 +73,19 @@ class Learner(BaseLearner):
                 device=self._device,
                 args=args
             )
-
-        # STAR 特征漂移对齐配置
-        self.use_feature_alignment = args.get("use_feature_alignment", False)
-        self.use_full_task_rehearsal = args.get("use_full_task_rehearsal", False)
-        self.star = None  # STAR 对齐器（延迟初始化）
-        
-        # 如果启用特征对齐且使用 HC-SOINN，初始化 STAR
-        if self.use_feature_alignment and self.use_hc_soinn:
-            # 定义特征提取函数（适配 SimpleVitNet 的网络结构）
-            def feature_extractor(x):
-                if isinstance(self._network, nn.DataParallel):
-                    feats = self._network.module.extract_vector(x)
-                else:
-                    feats = self._network.extract_vector(x)
-                return feats
-            
-            self.star = STARAligner(
-                hc_soinn=self.hc_soinn,
-                feature_extractor=feature_extractor,
-                device=self._device,
-                use_full_task_rehearsal=self.use_full_task_rehearsal,
-                star_mode=args.get("star_mode", "rigid"),
-                star_lambda=args.get("star_lambda", 0.3),
-            )
-            if self.use_full_task_rehearsal:
-                logging.info("STAR alignment initialized (FULL TASK REHEARSAL mode - for performance upper bound)")
-            else:
-                logging.info("STAR alignment initialized (anchor mode: all SOINN nodes + NCM points)")
         
         # NCM分类器：初始化类均值存储
         self._class_means = None
 
     def after_task(self):
         """
-        每个 task 结束后的处理流程（STAR 特征漂移对齐的核心入口）
+        每个 task 结束后的处理流程
         
         【Pipeline 流程说明】
-        1. 压缩 HC-SOINN（生成当前任务的节点）
-        2. 为当前任务选择锚点（用于下一轮对齐）
-        3. 簇结构分析实验：保存Task 1样本或计算Procrustes距离
-        4. 更新已知类别数
+        1. 簇结构分析实验：保存Task 1样本或计算Procrustes距离
+        2. 更新已知类别数
         """
-        # ========== Prepare current task class set ==========
-        current_task_classes = set(range(self._known_classes, self._total_classes))
-        
-        # ========== Step 1: 为当前任务选择锚点（用于下一轮对齐）==========
-        # 注意：HC-SOINN压缩已在_build_hc_soinn_bank中完成，这里不再重复压缩
-        if self.star is not None:
-            # 获取当前任务的训练数据集
-            dataset = self.data_manager.get_dataset(
-                np.arange(self._known_classes, self._total_classes),
-                source="train", mode="test"
-            )
-            self.star.select_anchors_for_current_task(
-                dataset=dataset,
-                batch_size=self.batch_size,
-                num_workers=num_workers,
-                current_task_classes=current_task_classes
-            )
-
-        # ========== Step 3: 簇结构分析实验：保存Task 1样本或计算Procrustes距离==========
+        # ========== Step 1: 簇结构分析实验：保存Task 1样本或计算Procrustes距离==========
         if self.cluster_analyzer is not None:
             if self._cur_task == 0:
                 # Task 1结束后：保存所有训练样本
@@ -151,7 +102,7 @@ class Learner(BaseLearner):
                 # 后续任务：计算Procrustes距离
                 self.cluster_analyzer.compute_procrustes_distances(self._cur_task)
         
-        # ========== Step 4: 更新已知类别数 ==========
+        # ========== Step 2: 更新已知类别数 ==========
         self._known_classes = self._total_classes
     
     def replace_fc(self,trainloader, model, args):
@@ -311,20 +262,6 @@ class Learner(BaseLearner):
         # 确保模型在正确的设备上并处于eval模式
         self._network.to(self._device)
         self._network.eval()
-        
-        # ========== Step 0: STAR 特征漂移对齐（在评估前对齐旧类别）==========
-        # 关键修复：在评估之前对齐旧类别，确保评估时使用的是对齐后的节点
-        if self.star is not None and self._cur_task > 0:
-            # 准备当前任务的类别集合（用于排除）
-            current_task_classes = set(range(self._known_classes, self._total_classes))
-            logging.info(
-                f"[STAR] Pre-evaluation alignment: Aligning old classes before evaluation "
-                f"(task {self._cur_task}, current task classes: {current_task_classes})"
-            )
-            self.star.align_old_classes(
-                cur_task=self._cur_task,
-                current_task_classes=current_task_classes
-            )
         
         # ========== Step 1: 构建 HC-SOINN bank ==========
         if getattr(self, "use_hc_soinn", False):
