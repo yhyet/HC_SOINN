@@ -11,6 +11,8 @@ HC-SOINN revisits the Nearest Class Mean (NCM) classifier commonly used in Class
 
 The framework further introduces **STAR** (Structure-Topology Alignment via Residuals), a pointwise trajectory tracking mechanism that adapts the learned topology to non-linear feature drift across incremental tasks.
 
+![HC-SOINN and STAR overview](figs/main.png)
+
 ## Getting Started
 
 ### Environments
