@@ -34,7 +34,7 @@ def load_json(setting_path):
 
 def setup_parser():
     parser = argparse.ArgumentParser(description='Reproduce of multiple pre-trained incremental learning algorthms.')
-    parser.add_argument('--config', type=str, default='./exps/simplecil.json',
+    parser.add_argument('--config', type=str, default='./exps/simplecil/simplecil.json',
                         help='Json file of settings.')
     parser.add_argument('--device', type=str, nargs='+', default=None,
                         help='Device(s) to use. Can specify multiple devices, e.g., --device 0 or --device 0 1. Use -1 for CPU.')
