@@ -2,6 +2,7 @@ import sys
 import logging
 import copy
 import torch
+import json
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
@@ -84,6 +85,7 @@ def _train(args):
         )
         
         is_last_task = (task == data_manager.nb_tasks - 1)
+        _apply_task_epoch_override(args, task, is_last_task)
         train_time = None
         eval_time = None
         
@@ -92,11 +94,44 @@ def _train(args):
             model.incremental_train(data_manager)
             train_end = time.time()
             train_time = train_end - train_start
-            
-            eval_start = time.time()
-            eval_results = model.eval_task()
-            eval_end = time.time()
-            eval_time = eval_end - eval_start
+            if args.get("training_time_profile_last_task", False):
+                timing_breakdown = {}
+                if hasattr(model, "get_last_training_time_breakdown"):
+                    timing_breakdown = model.get_last_training_time_breakdown()
+                _write_training_time_profile_result(
+                    args,
+                    {
+                        "classifier": args.get("training_time_classifier", args.get("prefix", "")),
+                        "seed": args.get("seed", ""),
+                        "task": task,
+                        "tuned_epoch": args.get("tuned_epoch", ""),
+                        "total_incremental_train_sec": train_time,
+                        "total_incremental_train_min": train_time / 60,
+                        "pure_train_sec": float(timing_breakdown.get("pure_train_sec", 0.0)),
+                        "periodic_eval_sec": float(timing_breakdown.get("periodic_eval_sec", 0.0)),
+                        "classifier_build_sec": float(timing_breakdown.get("classifier_build_sec", 0.0)),
+                    },
+                    logfilename + ".log",
+                )
+
+            if args.get("training_time_profile_last_task", False) and args.get("skip_eval_for_training_time_profile", True):
+                eval_start = time.time()
+                eval_results = {}
+                eval_end = time.time()
+                eval_time = eval_end - eval_start
+                logging.info("Skipping evaluation for last-task training time profile")
+            elif args.get("speed_profile_last_task", False):
+                eval_start = time.time()
+                profile_results = model.profile_last_task_classifiers()
+                eval_results = _speed_profile_results_to_eval_results(profile_results)
+                _write_speed_profile_results(args, profile_results, logfilename + ".log")
+                eval_end = time.time()
+                eval_time = eval_end - eval_start
+            else:
+                eval_start = time.time()
+                eval_results = model.eval_task()
+                eval_end = time.time()
+                eval_time = eval_end - eval_start
             
             logging.info("=" * 60)
             logging.info("Last Task (Task {}) Time Statistics:".format(task))
@@ -106,7 +141,11 @@ def _train(args):
             logging.info("=" * 60)
         else:
             model.incremental_train(data_manager)
-            eval_results = model.eval_task()
+            if args.get("training_time_profile_last_task", False) and args.get("skip_eval_for_training_time_profile", True):
+                eval_results = {}
+                logging.info("Skipping evaluation before last task for training time profile")
+            else:
+                eval_results = model.eval_task()
         
         model.after_task()
 
@@ -256,3 +295,232 @@ def _set_random(seed=1):
 def print_args(args):
     for key, value in args.items():
         logging.info("{}: {}".format(key, value))
+
+
+def _apply_task_epoch_override(args, task, is_last_task):
+    """Allow cheap early tasks and a full-epoch final task in timing experiments."""
+    if "_base_tuned_epoch" not in args:
+        args["_base_tuned_epoch"] = args.get("tuned_epoch")
+
+    if is_last_task and "last_task_tuned_epoch" in args:
+        args["tuned_epoch"] = args["last_task_tuned_epoch"]
+    elif (not is_last_task) and "pre_last_task_tuned_epoch" in args:
+        args["tuned_epoch"] = args["pre_last_task_tuned_epoch"]
+    else:
+        args["tuned_epoch"] = args["_base_tuned_epoch"]
+
+    logging.info(
+        "Task {} tuned_epoch set to {}{}".format(
+            task,
+            args["tuned_epoch"],
+            " (last task)" if is_last_task else "",
+        )
+    )
+
+
+def _write_training_time_profile_result(args, record, log_path):
+    """Persist last-task training time records plus aggregate summary files."""
+    output_prefix = args.get(
+        "training_time_output_prefix",
+        "resources/coda_prompt_cifar10task_training_time",
+    )
+    output_dir = os.path.dirname(output_prefix)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    row = dict(record)
+    row["config_prefix"] = args.get("prefix", "")
+    row["dataset"] = args.get("dataset", "")
+    row["log_path"] = log_path
+
+    json_path = output_prefix + ".json"
+    existing = []
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                existing = loaded
+        except json.JSONDecodeError:
+            logging.warning(f"Could not parse existing training time JSON: {json_path}")
+    existing.append(row)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2)
+
+    csv_path = output_prefix + ".csv"
+    fieldnames = [
+        "classifier", "seed", "task", "tuned_epoch", "total_incremental_train_sec",
+        "total_incremental_train_min", "pure_train_sec", "periodic_eval_sec",
+        "classifier_build_sec", "config_prefix", "dataset", "log_path",
+    ]
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(",".join(fieldnames) + "\n")
+        for item in existing:
+            values = []
+            for field in fieldnames:
+                value = item.get(field, "")
+                if isinstance(value, str):
+                    value = '"' + value.replace('"', '""') + '"'
+                values.append(str(value))
+            f.write(",".join(values) + "\n")
+
+    summary = _summarize_training_time_results(existing)
+    md_path = output_prefix + ".md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("# CODA-Prompt CIFAR 10-task Last-Task Training Time\n\n")
+        f.write("| classifier | repeats | tuned_epoch | total mean | total var | pure train mean | pure train var | periodic eval mean | build mean | build var |\n")
+        f.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        for item in summary:
+            f.write(
+                f"| {item['classifier']} | {item['repeats']} | {item['tuned_epoch']} | "
+                f"{item['total_incremental_train_sec_mean']:.6f} | "
+                f"{item['total_incremental_train_sec_var']:.6f} | "
+                f"{item['pure_train_sec_mean']:.6f} | {item['pure_train_sec_var']:.6f} | "
+                f"{item['periodic_eval_sec_mean']:.6f} | "
+                f"{item['classifier_build_sec_mean']:.6f} | "
+                f"{item['classifier_build_sec_var']:.6f} |\n"
+            )
+
+    logging.info(f"Training time profile results written to {json_path}, {csv_path}, {md_path}")
+
+
+def _summarize_training_time_results(rows):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["classifier"], []).append(row)
+
+    summary = []
+    metrics = [
+        "total_incremental_train_sec",
+        "pure_train_sec",
+        "periodic_eval_sec",
+        "classifier_build_sec",
+    ]
+    for classifier, items in grouped.items():
+        tuned_epochs = sorted({str(item.get("tuned_epoch", "")) for item in items})
+        summary_row = {
+            "classifier": classifier,
+            "repeats": len(items),
+            "tuned_epoch": "/".join(tuned_epochs),
+        }
+        for metric in metrics:
+            values = np.array([float(item.get(metric, 0.0)) for item in items], dtype=np.float64)
+            summary_row[f"{metric}_mean"] = float(values.mean()) if len(values) > 0 else 0.0
+            summary_row[f"{metric}_var"] = float(values.var(ddof=1)) if len(values) > 1 else 0.0
+            summary_row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        summary_row["total_incremental_train_min_mean"] = summary_row["total_incremental_train_sec_mean"] / 60
+        summary.append(summary_row)
+    return summary
+
+
+def _speed_profile_results_to_eval_results(profile_results):
+    """Convert profiler accuracy records into trainer-compatible eval results."""
+    eval_results = {}
+    for item in profile_results:
+        classifier = item["classifier"]
+        if classifier in eval_results:
+            continue
+        eval_results[classifier] = {
+            "grouped": {"total": item["top1"]},
+            "top1": item["top1"],
+            "top5": item["top5"],
+        }
+        if classifier == "kac":
+            eval_results["fc"] = eval_results[classifier]
+    return eval_results
+
+
+def _write_speed_profile_results(args, profile_results, log_path):
+    """Persist speed profile repeats plus aggregate summary files."""
+    output_prefix = args.get(
+        "speed_profile_output_prefix",
+        "resources/coda_prompt_cifar10task_speed_profile",
+    )
+    output_dir = os.path.dirname(output_prefix)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    enriched = []
+    for item in profile_results:
+        row = dict(item)
+        row["config_prefix"] = args.get("prefix", "")
+        row["dataset"] = args.get("dataset", "")
+        row["seed"] = args.get("seed", "")
+        row["log_path"] = log_path
+        enriched.append(row)
+
+    json_path = output_prefix + ".json"
+    existing = []
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                existing = loaded
+        except json.JSONDecodeError:
+            logging.warning(f"Could not parse existing speed profile JSON: {json_path}")
+    existing.extend(enriched)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2)
+
+    csv_path = output_prefix + ".csv"
+    fieldnames = [
+        "classifier", "repeat", "samples", "batches", "total_sec",
+        "backbone_sec", "backbone_pct", "classifier_sec", "classifier_pct",
+        "top1", "top5", "config_prefix", "dataset", "seed", "log_path",
+    ]
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(",".join(fieldnames) + "\n")
+        for row in existing:
+            values = []
+            for field in fieldnames:
+                value = row.get(field, "")
+                if isinstance(value, str):
+                    value = '"' + value.replace('"', '""') + '"'
+                values.append(str(value))
+            f.write(",".join(values) + "\n")
+
+    summary = _summarize_speed_profile_results(existing)
+    md_path = output_prefix + ".md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("# CODA-Prompt CIFAR 10-task Classifier Speed Profile\n\n")
+        f.write("| classifier | repeats | samples | total_sec mean±std | backbone_sec mean±std | backbone_pct | classifier_sec mean±std | classifier_pct | top1 | top5 |\n")
+        f.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        for row in summary:
+            f.write(
+                f"| {row['classifier']} | {row['repeats']} | {row['samples']} | "
+                f"{row['total_sec_mean']:.6f}±{row['total_sec_std']:.6f} | "
+                f"{row['backbone_sec_mean']:.6f}±{row['backbone_sec_std']:.6f} | "
+                f"{row['backbone_pct_mean']:.2f}% | "
+                f"{row['classifier_sec_mean']:.6f}±{row['classifier_sec_std']:.6f} | "
+                f"{row['classifier_pct_mean']:.2f}% | "
+                f"{row['top1_mean']:.2f} | {row['top5_mean']:.2f} |\n"
+            )
+
+    logging.info(f"Speed profile results written to {json_path}, {csv_path}, {md_path}")
+
+
+def _summarize_speed_profile_results(rows):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["classifier"], []).append(row)
+
+    summary = []
+    metric_names = [
+        "total_sec", "backbone_sec", "backbone_pct", "classifier_sec",
+        "classifier_pct", "top1", "top5",
+    ]
+    for classifier, items in grouped.items():
+        summary_row = {
+            "classifier": classifier,
+            "repeats": len(items),
+            "samples": int(items[0].get("samples", 0)),
+        }
+        for metric in metric_names:
+            values = np.array([float(item.get(metric, 0.0)) for item in items], dtype=np.float64)
+            summary_row[f"{metric}_mean"] = float(values.mean()) if len(values) > 0 else 0.0
+            summary_row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        summary.append(summary_row)
+    return summary

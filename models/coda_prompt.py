@@ -296,11 +296,25 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
+        profile_training_time = self._should_profile_training_time()
+        if profile_training_time:
+            self._last_training_time_breakdown = {
+                "pure_train_sec": 0.0,
+                "periodic_eval_sec": 0.0,
+                "classifier_build_sec": 0.0,
+            }
+
         self._train(self.train_loader, self.test_loader)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
-        
+
+        if profile_training_time:
+            self._sync_training_time_profile()
+            build_start = time.perf_counter()
         self._build_classifiers()
+        if profile_training_time:
+            self._sync_training_time_profile()
+            self._last_training_time_breakdown["classifier_build_sec"] = time.perf_counter() - build_start
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
@@ -310,6 +324,22 @@ class Learner(BaseLearner):
 
         self.data_weighting()
         self._init_train(train_loader, test_loader, optimizer, scheduler)
+
+    def _should_profile_training_time(self):
+        return bool(self.args.get("training_time_profile_last_task", False)) and (
+            self._cur_task == int(self.args.get("nb_tasks", 0)) - 1
+        )
+
+    def _sync_training_time_profile(self):
+        if (
+            bool(self.args.get("training_time_sync_cuda", True))
+            and self._device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize(device=self._device)
+
+    def get_last_training_time_breakdown(self):
+        return getattr(self, "_last_training_time_breakdown", {})
 
 
     def _build_classifiers(self):
@@ -683,12 +713,23 @@ class Learner(BaseLearner):
         return scheduler
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+        profile_training_time = self._should_profile_training_time()
+        if profile_training_time and not hasattr(self, "_last_training_time_breakdown"):
+            self._last_training_time_breakdown = {
+                "pure_train_sec": 0.0,
+                "periodic_eval_sec": 0.0,
+                "classifier_build_sec": 0.0,
+            }
+
         prog_bar = tqdm(range(self.args['tuned_epoch']))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
 
             losses = 0.0
             correct, total = 0, 0
+            if profile_training_time:
+                self._sync_training_time_profile()
+                train_start = time.perf_counter()
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
             
@@ -711,6 +752,9 @@ class Learner(BaseLearner):
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
+            if profile_training_time:
+                self._sync_training_time_profile()
+                self._last_training_time_breakdown["pure_train_sec"] += time.perf_counter() - train_start
 
             if scheduler:
                 scheduler.step()
@@ -718,7 +762,13 @@ class Learner(BaseLearner):
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
             if (epoch + 1) % 5 == 0:
+                if profile_training_time:
+                    self._sync_training_time_profile()
+                    eval_start = time.perf_counter()
                 test_acc = self._compute_accuracy(self._network, test_loader)
+                if profile_training_time:
+                    self._sync_training_time_profile()
+                    self._last_training_time_breakdown["periodic_eval_sec"] += time.perf_counter() - eval_start
                 info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
@@ -957,6 +1007,137 @@ class Learner(BaseLearner):
             logging.warning("No predictions generated from HC-SOINN + FC fusion evaluation")
             return np.array([]), np.array([])
         return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def _profile_sync_if_needed(self):
+        """Synchronize CUDA timers when speed profiling uses GPU."""
+        if (
+            bool(self.args.get("speed_profile_sync_cuda", True))
+            and self._device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize(device=self._device)
+
+    def _profile_classifier_once(self, classifier_name):
+        """Profile one classifier on the current test loader."""
+        classifier_name = classifier_name.lower()
+        if classifier_name == "hc_soinn_star":
+            classifier_name = "hc_soinn"
+
+        self._network.eval()
+        y_pred, y_true = [], []
+        backbone_sec = 0.0
+        classifier_sec = 0.0
+        batches = 0
+        samples = 0
+        eval_classes = self.init_cls if self.test_only_first_task_classes else self._total_classes
+
+        if classifier_name in ("fc", "kac", "ncm"):
+            network = self._network.module if isinstance(self._network, nn.DataParallel) else self._network
+        elif classifier_name == "hc_soinn":
+            if not hasattr(self, "hc_soinn"):
+                raise RuntimeError("HC-SOINN classifier is not initialized")
+            feature_fn = self._get_hc_soinn_feature_fn()
+        else:
+            raise ValueError(f"Unsupported speed profile classifier: {classifier_name}")
+
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(self.test_loader):
+                self._profile_sync_if_needed()
+                t0 = time.perf_counter()
+                inputs = inputs.to(self._device)
+                if classifier_name == "hc_soinn":
+                    features = feature_fn(inputs)
+                else:
+                    features = network.extract_vector(inputs)
+                self._profile_sync_if_needed()
+                backbone_sec += time.perf_counter() - t0
+
+                self._profile_sync_if_needed()
+                t0 = time.perf_counter()
+                if classifier_name in ("fc", "kac"):
+                    outputs = network.fc(features)[:, :eval_classes]
+                    predicts = torch.topk(
+                        outputs, k=self.topk, dim=1, largest=True, sorted=True
+                    )[1]
+                    batch_pred = predicts.cpu().numpy()
+                elif classifier_name == "ncm":
+                    ncm_output = network.ncm_fc(features)
+                    ncm_logits = ncm_output["logits"] if isinstance(ncm_output, dict) else ncm_output
+                    predicts = torch.topk(
+                        ncm_logits[:, :eval_classes], k=self.topk, dim=1, largest=True, sorted=True
+                    )[1]
+                    batch_pred = predicts.cpu().numpy()
+                else:
+                    features = features.detach().cpu()
+                    if len(features.shape) == 1:
+                        features = features.reshape(1, -1)
+                    elif len(features.shape) != 2:
+                        raise ValueError(f"Expected 2D features [B, D], got shape {features.shape}")
+                    batch_pred = self.hc_soinn.predict_topk(
+                        features, self.topk, self._total_classes, device=self._device
+                    )
+                self._profile_sync_if_needed()
+                classifier_sec += time.perf_counter() - t0
+
+                y_pred.append(batch_pred)
+                y_true.append(targets.cpu().numpy())
+                batches += 1
+                samples += int(targets.shape[0])
+
+        if len(y_pred) == 0:
+            raise RuntimeError(f"No predictions generated for {classifier_name} speed profile")
+
+        y_pred = np.concatenate(y_pred)
+        y_true = np.concatenate(y_true)
+        acc = self._evaluate(y_pred, y_true)
+        total_sec = backbone_sec + classifier_sec
+        backbone_pct = (backbone_sec / total_sec * 100.0) if total_sec > 0 else 0.0
+        classifier_pct = (classifier_sec / total_sec * 100.0) if total_sec > 0 else 0.0
+
+        return {
+            "classifier": classifier_name,
+            "task": int(self._cur_task),
+            "samples": int(samples),
+            "batches": int(batches),
+            "total_sec": float(total_sec),
+            "backbone_sec": float(backbone_sec),
+            "backbone_pct": float(backbone_pct),
+            "classifier_sec": float(classifier_sec),
+            "classifier_pct": float(classifier_pct),
+            "top1": float(acc["top1"]),
+            "top5": float(acc[f"top{self.topk}"]),
+        }
+
+    def profile_last_task_classifiers(self):
+        """Run configured single-classifier speed profiles for the last task."""
+        classifiers = self.args.get("speed_profile_classifiers", [])
+        if isinstance(classifiers, str):
+            classifiers = [classifiers]
+        repeats = int(self.args.get("speed_profile_repeats", 3))
+        profile_results = []
+
+        for classifier_name in classifiers:
+            display_name = str(classifier_name)
+            logging.info("=" * 72)
+            logging.info(
+                f"[Speed Profile] classifier={display_name}, task={self._cur_task}, repeats={repeats}"
+            )
+            for repeat_idx in range(repeats):
+                result = self._profile_classifier_once(display_name)
+                result["classifier"] = display_name
+                result["repeat"] = repeat_idx + 1
+                profile_results.append(result)
+                logging.info(
+                    "[Speed Profile] "
+                    f"classifier={display_name}, repeat={repeat_idx + 1}/{repeats}, "
+                    f"total={result['total_sec']:.6f}s, "
+                    f"backbone={result['backbone_sec']:.6f}s ({result['backbone_pct']:.2f}%), "
+                    f"classifier={result['classifier_sec']:.6f}s ({result['classifier_pct']:.2f}%), "
+                    f"top1={result['top1']:.2f}, top5={result['top5']:.2f}"
+                )
+            logging.info("=" * 72)
+
+        return profile_results
 
     def eval_task(self):
         """Handle eval task."""
