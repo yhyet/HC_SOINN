@@ -7,3 +7,4 @@ __pycache__/
 *.ipynb
 *.pdf
 resources/
+procrustes_analysis/
